@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from app.services import investigation
 from app.services import opensre_cli
 from app.services import kubectl
+from app.services import portforward
 from app.services import yugabyte
 from app.services import aerospike
 from app.utils.command import run_command
@@ -44,13 +45,15 @@ def _target_to_container(target: str):
 
 
 def _seed_yugabyte():
-    yugabyte.execute(
+    # NOTE: seed writes use execute_raw (mutations allowed) — the read-only
+    # yugabyte.execute()/query() reject CREATE/INSERT by design.
+    yugabyte.execute_raw(
         "CREATE TABLE IF NOT EXISTS service_instances "
         "(id INT PRIMARY KEY, name TEXT NOT NULL)"
     )
     inserted = []
     for row_id, name in INSTANCE_ROWS:
-        res = yugabyte.execute(
+        res = yugabyte.execute_raw(
             f"INSERT INTO service_instances (id, name) "
             f"VALUES ({row_id}, '{name}') "
             f"ON CONFLICT (id) DO UPDATE SET name = '{name}' "
@@ -90,29 +93,66 @@ def _start_container(name: str):
     }
 
 
+# Databases run as Kubernetes StatefulSets (namespace/databases), not docker
+# containers. Scale the StatefulSet to 0/1 for unavailable/recover scenarios.
+DB_STATEFULSETS = {
+    "yugabyte": "yugabytedb",
+    "aerospike": "aerospike",
+}
+DB_NAMESPACE = "databases"
+
+PORT_FORWARD_CMDS = {
+    "yugabyte": "kubectl port-forward -n databases svc/yugabytedb 5433:5433",
+    "aerospike": "kubectl port-forward -n databases svc/aerospike 3001:3000",
+}
+
+
+def _port_forward_hint(target: str) -> str:
+    return (
+        "If health is still red after a successful rollout, the kubectl "
+        f"port-forward died when the StatefulSet scaled to 0. Restart it: "
+        f"{PORT_FORWARD_CMDS.get(target, '')} — then re-check health. "
+        "Do NOT use docker start (DBs run in Kubernetes)."
+    )
+
+
+def _scale_db(target: str, replicas: int):
+    """Scale a database StatefulSet. Returns (success, stdout_or_error)."""
+    sts = DB_STATEFULSETS.get(target, target)
+    result = run_command([
+        "kubectl", "scale", "statefulset", sts,
+        "-n", DB_NAMESPACE, f"--replicas={replicas}",
+    ])
+    if not result.get("success"):
+        return False, result.get("stderr") or result.get("stdout") or "kubectl scale failed"
+    return True, result.get("stdout", "")
+
+
 # ------------------------------------------------------------------
 # Step 1: Seed + stop  (leaves DB DOWN so audience can see red health)
 # ------------------------------------------------------------------
 @router.post("/db-failure/fail")
 def fail(request: TargetRequest):
     target = request.target.lower()
-    container = _target_to_container(target)
 
     if target not in ("yugabyte", "aerospike"):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
     seed = _seed_yugabyte() if target == "yugabyte" else _seed_aerospike()
-    stop = _stop_container(container)
+    # K8s-native: scale the StatefulSet to 0 (replaces docker stop)
+    scaled, detail = _scale_db(target, 0)
 
     return {
-        "success": stop.get("success", False),
+        "success": scaled,
         "target": target,
-        "container": container,
+        "statefulset": DB_STATEFULSETS[target],
+        "namespace": DB_NAMESPACE,
         "seed": seed,
         "fault": {
             "action": f"{target}-down",
-            "injected": stop.get("success", False),
-            "container_stopped": container,
+            "injected": scaled,
+            "statefulset_scaled": DB_STATEFULSETS[target],
+            "detail": detail,
         },
     }
 
@@ -154,22 +194,37 @@ def investigate(request: TargetRequest):
 @router.post("/db-failure/recover")
 def recover(request: TargetRequest):
     target = request.target.lower()
-    container = _target_to_container(target)
 
     if target not in ("yugabyte", "aerospike"):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
-    start = _start_container(container)
+    # K8s-native: scale the StatefulSet back to 1 (replaces docker start)
+    scaled, detail = _scale_db(target, 1)
+    rollout = run_command([
+        "kubectl", "rollout", "status", f"statefulset/{DB_STATEFULSETS[target]}",
+        "-n", DB_NAMESPACE, "--timeout=240s",
+    ], timeout=260)
+    # The port-forward dies on scale-to-0 — restart it so health flips green
+    # without manual terminal steps.
+    pf = portforward.ensure(target) if rollout.get("success") else {
+        "success": False,
+        "detail": "Skipped (rollout did not complete)",
+        "command": portforward.command_string(target),
+    }
     health = investigation.collect_target_evidence(target)
 
     return {
-        "success": start.get("success", False),
+        "success": scaled and rollout.get("success", False),
         "target": target,
-        "container": container,
+        "statefulset": DB_STATEFULSETS[target],
         "recovery": {
             "action": f"{target}-up",
-            "success": start.get("success", False),
-            "container_restarted": container,
+            "success": scaled,
+            "statefulset_restored": DB_STATEFULSETS[target],
+            "rollout": rollout.get("stdout", "") or rollout.get("stderr", ""),
+            "detail": detail,
+            "port_forward": pf,
+            "port_forward_hint": _port_forward_hint(target),
         },
         "health": health.get("evidence", {}),
     }
@@ -274,7 +329,7 @@ def node_investigate(request: NodeRequest):
     # Get node conditions for evidence summary
     conditions = []
     if node_state.get("success"):
-        for c in node_state.get("node", {}).get("conditions", []):
+        for c in (node_state.get("node") or {}).get("conditions", []) or []:
             if c.get("status") != "True":
                 continue
             conditions.append(f"{c['type']}={c['status']} ({c.get('reason', '')})")
@@ -287,7 +342,7 @@ def node_investigate(request: NodeRequest):
     # Inject the node problem into evidence for OpenSRE
     evidence["node_problem"] = {
         "node": node,
-        "unschedulable": node_state.get("node", {}).get("unschedulable", False) if node_state.get("success") else None,
+        "unschedulable": (node_state.get("node") or {}).get("unschedulable", False) if node_state.get("success") else None,
         "conditions": conditions,
         "pod_count": node_usage.get("pod_count"),
         "restarts_total": node_usage.get("restarts_total"),
@@ -609,29 +664,30 @@ class DBScenarioRequest(BaseModel):
 # ------------------------------------------------------------------
 @router.post("/db-scenario/unavailable/fail")
 def db_unavailable_fail(request: DBScenarioRequest):
-    """Step 1: Stop the database container to simulate unavailability."""
+    """Step 1: Scale the database StatefulSet to 0 to simulate unavailability."""
     target = request.target.lower()
-    container = _target_to_container(target)
 
     if target not in ("yugabyte", "aerospike"):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
-    # Seed data first
+    # Seed data first (while DB is still up)
     seed = _seed_yugabyte() if target == "yugabyte" else _seed_aerospike()
-    # Stop container
-    stop = _stop_container(container)
+    # Scale StatefulSet to 0 (K8s-native, replaces docker stop)
+    scaled, detail = _scale_db(target, 0)
 
     return {
-        "success": stop.get("success", False),
+        "success": scaled,
         "scenario": "database-unavailable",
         "target": target,
-        "container": container,
+        "statefulset": DB_STATEFULSETS[target],
+        "namespace": DB_NAMESPACE,
         "seed": seed,
         "fault": {
             "action": f"{target}-down",
-            "injected": stop.get("success", False),
-            "container_stopped": container,
-            "description": f"{target.capitalize()} container stopped - simulating connection refused/unavailable"
+            "injected": scaled,
+            "statefulset_scaled": DB_STATEFULSETS[target],
+            "detail": detail,
+            "description": f"{target.capitalize()} StatefulSet scaled to 0 - simulating connection refused/unavailable"
         },
     }
 
@@ -674,28 +730,40 @@ def db_unavailable_investigate(request: DBScenarioRequest):
 
 @router.post("/db-scenario/unavailable/recover")
 def db_unavailable_recover(request: DBScenarioRequest):
-    """Step 3: Restart the database container to recover."""
+    """Step 3: Scale the database StatefulSet back to 1 to recover."""
     target = request.target.lower()
-    container = _target_to_container(target)
 
     if target not in ("yugabyte", "aerospike"):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
-    start = _start_container(container)
-    # Wait a bit for DB to be ready
-    import time
-    time.sleep(3)
+    scaled, detail = _scale_db(target, 1)
+    # Wait for the StatefulSet rollout (YugabyteDB takes ~2-3 min on cold start)
+    rollout = run_command([
+        "kubectl", "rollout", "status", f"statefulset/{DB_STATEFULSETS[target]}",
+        "-n", DB_NAMESPACE, "--timeout=240s",
+    ], timeout=260)
+    # The port-forward dies on scale-to-0 — restart it so health flips green
+    # without manual terminal steps.
+    pf = portforward.ensure(target) if rollout.get("success") else {
+        "success": False,
+        "detail": "Skipped (rollout did not complete)",
+        "command": portforward.command_string(target),
+    }
     health = investigation.collect_database_evidence(target)
 
     return {
-        "success": start.get("success", False),
+        "success": scaled and rollout.get("success", False),
         "scenario": "database-unavailable",
         "target": target,
-        "container": container,
+        "statefulset": DB_STATEFULSETS[target],
         "recovery": {
             "action": f"{target}-up",
-            "success": start.get("success", False),
-            "container_restarted": container,
+            "success": scaled,
+            "statefulset_restored": DB_STATEFULSETS[target],
+            "rollout": rollout.get("stdout", "") or rollout.get("stderr", ""),
+            "detail": detail,
+            "port_forward": pf,
+            "port_forward_hint": _port_forward_hint(target),
         },
         "health": health.get("evidence", {}),
     }
@@ -713,8 +781,10 @@ def db_latency_induce(request: DBScenarioRequest):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
     if target == "yugabyte":
-        # Create a large table and run heavy queries to induce latency
-        yugabyte.execute("""
+        # Create a large table and run heavy queries to induce latency.
+        # NOTE: writes use execute_raw — yugabyte.execute()/query() are
+        # read-only by design and reject CREATE/INSERT.
+        yugabyte.execute_raw("""
             CREATE TABLE IF NOT EXISTS latency_test (
                 id BIGSERIAL PRIMARY KEY,
                 data TEXT,
@@ -723,15 +793,16 @@ def db_latency_induce(request: DBScenarioRequest):
         """)
         # Insert many rows
         for i in range(100):
-            yugabyte.execute(
+            yugabyte.execute_raw(
                 "INSERT INTO latency_test (data) VALUES (%s)",
                 (f"test-data-{'x' * 1000}",)
             )
-        # Run a slow query (no index on data column)
+        # Run a slow query (no index on data column).
+        # NOTE: %% escaping — psycopg2 treats bare % as a placeholder.
         result = yugabyte.query("""
-            SELECT * FROM latency_test 
-            WHERE data LIKE '%test%' 
-            ORDER BY created_at DESC 
+            SELECT * FROM latency_test
+            WHERE data LIKE '%%test%%'
+            ORDER BY created_at DESC
             LIMIT 100
         """)
         return {
@@ -808,7 +879,7 @@ def db_latency_recover(request: DBScenarioRequest):
         raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
 
     if target == "yugabyte":
-        yugabyte.execute("DROP TABLE IF EXISTS latency_test")
+        yugabyte.execute_raw("DROP TABLE IF EXISTS latency_test")
     else:
         # Delete latency test records
         for i in range(200):
@@ -1032,7 +1103,141 @@ def db_data_integrity_insert_invalid(request: DBScenarioRequest):
 
 
 # ------------------------------------------------------------------
-# Combined scenario: Run all three scenarios for a target
+# SCENARIO 4: Connection Pressure (YugabyteDB)
+# ------------------------------------------------------------------
+@router.post("/db-scenario/connection-pressure/induce")
+def db_connection_pressure_induce(request: DBScenarioRequest):
+    """Step 1: Induce connection pressure by opening many connections."""
+    target = request.target.lower()
+
+    if target not in ("yugabyte", "aerospike"):
+        raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
+
+    if target == "yugabyte":
+        # Create connection pool exhaustion by opening many connections
+        # We'll create a table and run many concurrent-like queries.
+        # NOTE: writes use execute_raw — read-only execute() rejects DDL/DML.
+        yugabyte.execute_raw("""
+            CREATE TABLE IF NOT EXISTS connection_test (
+                id BIGSERIAL PRIMARY KEY,
+                data TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Insert some data
+        for i in range(50):
+            yugabyte.execute_raw(
+                "INSERT INTO connection_test (data) VALUES (%s)",
+                (f"conn-test-{'x' * 500}",)
+            )
+        # Run multiple queries to simulate connection pressure
+        for _ in range(10):
+            yugabyte.query("SELECT pg_sleep(0.1), * FROM connection_test LIMIT 10")
+        
+        return {
+            "success": True,
+            "scenario": "connection-pressure",
+            "target": target,
+            "action": "induced-connection-pressure",
+            "details": "Created test table, ran concurrent-like queries to simulate connection pressure",
+        }
+    else:
+        # Aerospike: simulate connection pressure with many operations
+        for i in range(100):
+            aerospike.write("test", "connection_pressure", f"key-{i}", {
+                "data": "x" * 2000,
+                "index": i,
+                "timestamp": time.time(),
+            })
+        # Run scans to keep connections busy
+        for _ in range(5):
+            aerospike.scan("test", "connection_pressure")
+        
+        return {
+            "success": True,
+            "scenario": "connection-pressure",
+            "target": target,
+            "action": "induced-connection-pressure",
+            "details": "Wrote records and ran scans to simulate connection pressure",
+        }
+
+
+@router.post("/db-scenario/connection-pressure/investigate")
+def db_connection_pressure_investigate(request: DBScenarioRequest):
+    """Step 2: Collect evidence and run OpenSRE investigation for connection pressure."""
+    target = request.target.lower()
+
+    if target not in ("yugabyte", "aerospike"):
+        raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
+
+    evidence_result = investigation.collect_database_evidence(target)
+
+    if not evidence_result.get("success"):
+        return {
+            "success": False,
+            "error": evidence_result.get("error", "Evidence collection failed"),
+        }
+
+    evidence = evidence_result["evidence"]
+    evidence["question"] = (
+        f"The {target.capitalize()} database is experiencing connection pressure. "
+        f"Applications are reporting connection timeouts, pool exhaustion, or slow connection acquisition. "
+        f"Investigate the database for connection pool saturation, max connections reached, "
+        f"idle-in-transaction connections, or other connection-related issues. "
+        f"Provide: root cause, confidence, evidence, timeline, affected component, "
+        f"and recommended remediation."
+    )
+
+    opensre_result = opensre_cli.investigate(evidence)
+
+    return {
+        "success": opensre_result.get("returncode") == 0,
+        "scenario": "connection-pressure",
+        "target": target,
+        "evidence": evidence,
+        "opensre": opensre_result,
+    }
+
+
+@router.post("/db-scenario/connection-pressure/recover")
+def db_connection_pressure_recover(request: DBScenarioRequest):
+    """Step 3: Clean up connection pressure inducing data."""
+    target = request.target.lower()
+
+    if target not in ("yugabyte", "aerospike"):
+        raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
+
+    if target == "yugabyte":
+        yugabyte.execute_raw("DROP TABLE IF EXISTS connection_test")
+        # Terminate any idle connections (mutation via function — use execute_raw)
+        yugabyte.execute_raw("""
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+            AND pid <> pg_backend_pid()
+            AND state IN ('idle', 'idle in transaction')
+        """)
+    else:
+        # Delete connection pressure test records
+        for i in range(100):
+            aerospike.delete("test", "connection_pressure", f"key-{i}")
+
+    health = investigation.collect_database_evidence(target)
+
+    return {
+        "success": True,
+        "scenario": "connection-pressure",
+        "target": target,
+        "recovery": {
+            "action": "cleanup-connection-pressure-data",
+            "success": True,
+        },
+        "health": health.get("evidence", {}),
+    }
+
+
+# ------------------------------------------------------------------
+# Combined scenario: Run all scenarios for a target
 # ------------------------------------------------------------------
 @router.get("/db-scenario/list")
 def list_db_scenarios():
@@ -1050,6 +1255,13 @@ def list_db_scenarios():
                 "id": "latency",
                 "name": "Database/Query Latency Problem",
                 "description": "Induce high latency via heavy queries, investigate slow queries, then clean up",
+                "steps": ["induce", "investigate", "recover"],
+                "targets": ["yugabyte", "aerospike"],
+            },
+            {
+                "id": "connection-pressure",
+                "name": "Database Connection Pressure",
+                "description": "Simulate connection pool exhaustion, investigate connection issues, then recover",
                 "steps": ["induce", "investigate", "recover"],
                 "targets": ["yugabyte", "aerospike"],
             },

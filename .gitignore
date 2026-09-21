@@ -9,3 +9,4 @@ node_modules/
 dist/
 .venv/
 chaos/experiments/
+opensre-backend/data/

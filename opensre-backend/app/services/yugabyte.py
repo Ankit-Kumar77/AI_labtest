@@ -1,3 +1,5 @@
+import re
+
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -57,8 +59,10 @@ def _validate_read_only_sql(sql: str) -> tuple[bool, str | None]:
     if first_word not in READ_ONLY_SQL_PREFIXES:
         return False, f"Only read-only queries allowed. Query starts with: {first_word}"
 
+    # Match forbidden keywords as whole words only — substring matching
+    # false-positives on common identifiers (e.g. CREATE inside created_at).
     for keyword in FORBIDDEN_SQL_KEYWORDS:
-        if keyword in stripped:
+        if re.search(r"\b" + re.escape(keyword) + r"\b", stripped):
             return False, f"Forbidden keyword detected: {keyword}"
 
     return True, None
@@ -110,7 +114,24 @@ def health():
         conn.close()
         return {"success": True, "status": "connected"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        out = {"success": False, "error": str(e)}
+        try:
+            from app.services import containers
+
+            state = containers.container_state("yugabyte")
+            if state.get("success") and state.get("running"):
+                out["hint"] = (
+                    "Database pod is Running in Kubernetes but unreachable "
+                    "from the backend — the kubectl port-forward is down "
+                    "(it dies when the StatefulSet scales to 0). Restart "
+                    "it, then re-check health. Do NOT use docker start."
+                )
+                out["port_forward"] = (
+                    "kubectl port-forward -n databases svc/yugabytedb 5433:5433"
+                )
+        except Exception:
+            pass
+        return out
 
 
 def execute(sql: str):

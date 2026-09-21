@@ -26,29 +26,50 @@ import {
 } from "lucide-react";
 
 const FAILURES = [
-  { action: "aerospike-down", label: "Aerospike down", desc: "stop the Aerospike container", icon: Database, risk: "db" },
-  { action: "yugabyte-down", label: "YugabyteDB down", desc: "stop the YugabyteDB container", icon: HardDrive, risk: "db" },
-  { action: "pod-crash", label: "Pod crash", desc: "crash the catalog-api container (real restart)", icon: Server, risk: "pod" },
-  { action: "pod-delete", label: "Pod delete", desc: "delete the catalog-api pod (self-heal)", icon: Server, risk: "pod" },
-  { action: "pod-cpu", label: "CPU spike", desc: "busy-loop the catalog-api CPU", icon: Fuel, risk: "pod" },
-  { action: "pod-memory", label: "Memory spike", desc: "inflate catalog-api memory", icon: Server, risk: "pod" },
-  { action: "pod-latency", label: "Latency spike (catalog)", desc: "add +5s latency to catalog-api traffic", icon: Timer, risk: "pod" },
-  { action: "flaky-latency", label: "Latency spike (flaky)", desc: "add +3s latency to flaky-service traffic", icon: Timer, risk: "pod" },
-  { action: "system-pod-kill", label: "Kill system pod", desc: "delete a kube-system pod (coredns)", icon: Server, risk: "cluster" },
-  { action: "coredns-kill", label: "CoreDNS pod kill", desc: "delete one CoreDNS pod (self-heals)", icon: Globe, risk: "dns" },
-  { action: "coredns-down", label: "CoreDNS down", desc: "scale CoreDNS to 0 (DNS outage)", icon: Globe, risk: "dns" },
-  { action: "coredns-latency", label: "DNS latency", desc: "netem delay — DNS probe slows", icon: Timer, risk: "dns" },
-  { action: "elk-error", label: "ELK error signal", desc: "inject ERROR/EXCEPTION logs", icon: AlertCircle, risk: "elk" },
-  { action: "elk-connection-refused", label: "ELK connection refused", desc: "inject CONNECTION REFUSED logs", icon: AlertCircle, risk: "elk" },
-  { action: "elk-timeout", label: "ELK timeout", desc: "inject TIMEOUT/TIMED OUT logs", icon: AlertCircle, risk: "elk" },
-  { action: "node-cordon", label: "Cordon node", desc: "mark worker unschedulable", icon: Server, risk: "cluster" },
-  { action: "node-drain", label: "Drain node", desc: "evict all pods off the worker", icon: Server, risk: "cluster" },
-  { action: "node-network-latency", label: "Node network latency", desc: "netem delay on worker egress", icon: Activity, risk: "cluster" },
+  // Database failures
+  { action: "aerospike-down", label: "Aerospike Unavailable", desc: "scale Aerospike StatefulSet to 0 (K8s)", icon: Database, risk: "db", category: "database" },
+  { action: "yugabyte-down", label: "YugabyteDB Unavailable", desc: "scale YugabyteDB StatefulSet to 0 (K8s)", icon: HardDrive, risk: "db", category: "database" },
+  { action: "yugabyte-latency", label: "YugabyteDB High Latency", desc: "induce slow queries via heavy workload", icon: Timer, risk: "db", category: "database" },
+  { action: "yugabyte-connection-pressure", label: "YugabyteDB Connection Pressure", desc: "simulate connection pool exhaustion", icon: Activity, risk: "db", category: "database" },
+  { action: "aerospike-latency", label: "Aerospike High Latency", desc: "induce slow operations via heavy workload", icon: Timer, risk: "db", category: "database" },
+  // Pod failures (shown in "Pod failures" group below)
+  { action: "pod-crash", label: "Pod crash", desc: "crash the catalog-api container (real restart)", icon: Server, risk: "pod", category: "pod" },
+  { action: "pod-delete", label: "Pod delete", desc: "delete the catalog-api pod (self-heal)", icon: Server, risk: "pod", category: "pod" },
+  { action: "pod-cpu", label: "CPU spike", desc: "busy-loop the catalog-api CPU", icon: Fuel, risk: "pod", category: "pod" },
+  { action: "pod-memory", label: "Memory spike", desc: "inflate catalog-api memory", icon: Server, risk: "pod", category: "pod" },
+  { action: "pod-latency", label: "Latency spike (catalog)", desc: "add +5s latency to catalog-api traffic", icon: Timer, risk: "pod", category: "pod" },
+  { action: "flaky-latency", label: "Latency spike (flaky)", desc: "add +3s latency to flaky-service traffic", icon: Timer, risk: "pod", category: "pod" },
+  // Cluster / node failures (shown in "Cluster failures" group below)
+  { action: "system-pod-kill", label: "Kill system pod", desc: "delete a kube-system pod (coredns)", icon: Server, risk: "cluster", category: "cluster" },
+  { action: "node-cordon", label: "Cordon node", desc: "mark worker unschedulable", icon: Server, risk: "cluster", category: "cluster" },
+  { action: "node-drain", label: "Drain node", desc: "evict all pods off the worker", icon: Server, risk: "cluster", category: "cluster" },
+  { action: "node-network-latency", label: "Node network latency", desc: "netem delay on worker egress", icon: Activity, risk: "cluster", category: "cluster" },
+  // NOTE: CoreDNS + ELK failures have dedicated cards above (CoreDNS failure,
+  // ELK log signal demo) and are intentionally NOT repeated here.
+  { action: "coredns-kill", label: "CoreDNS pod kill", desc: "delete one CoreDNS pod (self-heals)", icon: Globe, risk: "dns", category: "dns" },
+  { action: "coredns-down", label: "CoreDNS down", desc: "scale CoreDNS to 0 (DNS outage)", icon: Globe, risk: "dns", category: "dns" },
+  { action: "coredns-latency", label: "DNS latency", desc: "netem delay — DNS probe slows", icon: Timer, risk: "dns", category: "dns" },
+  { action: "elk-error", label: "ELK error signal", desc: "inject ERROR/EXCEPTION logs", icon: AlertCircle, risk: "elk", category: "elk" },
+  { action: "elk-connection-refused", label: "ELK connection refused", desc: "inject CONNECTION REFUSED logs", icon: AlertCircle, risk: "elk", category: "elk" },
+  { action: "elk-timeout", label: "ELK timeout", desc: "inject TIMEOUT/TIMED OUT logs", icon: AlertCircle, risk: "elk", category: "elk" },
 ];
+
+// Failures with dedicated cards above (database section, CoreDNS card, ELK
+// card) are excluded from the generic grid to avoid duplicates.
+const GENERIC_CATEGORIES = [
+  { id: "pod", title: "Pod failures", hint: "catalog-api / flaky-service workloads" },
+  { id: "cluster", title: "Cluster / node failures", hint: "worker node and system pods" },
+];
+
+// Game-day only supports metric-visible runbook faults.
+const GAMEDAY_FAULTS = FAILURES.filter((f) => f.category === "pod" || f.category === "cluster");
 
 const RECOVERY = [
   { action: "aerospike-up", label: "Aerospike up", icon: Database },
   { action: "yugabyte-up", label: "YugabyteDB up", icon: HardDrive },
+  { action: "yugabyte-latency-recover", label: "Clear YugabyteDB latency", icon: Timer },
+  { action: "yugabyte-connection-pressure-recover", label: "Clear YugabyteDB connection pressure", icon: Activity },
+  { action: "aerospike-latency-recover", label: "Clear Aerospike latency", icon: Timer },
   { action: "latency-off", label: "Clear catalog latency", icon: Timer },
   { action: "flaky-latency-off", label: "Clear flaky latency", icon: Timer },
   { action: "network-latency-off", label: "Clear netem delay", icon: Activity },
@@ -152,7 +173,11 @@ export default function Chaos() {
       const body = kind === "seed" ? {} : { action };
       const res = await api.post(url, body);
       if (res.data.success) {
-        setLog(res.data.stdout || "(no output)");
+        setLog(
+          [res.data.stdout || "(no output)", res.data.port_forward_hint]
+            .filter(Boolean)
+            .join("\n\n")
+        );
       } else {
         setError(res.data.error || "Action failed");
         setLog(res.data.stdout || "");
@@ -199,8 +224,14 @@ export default function Chaos() {
             (summary ? `\n\nNginx summary: 5xx=${summary.http_5xx} 502=${summary.http_502} 503=${summary.http_503} 504=${summary.http_504}` : "")
         );
       } else {
-        setError(res.data.error || "Nginx action failed");
-        setLog(JSON.stringify(res.data, null, 2));
+        setError(
+          res.data.opensre?.error || res.data.error || "Nginx action failed"
+        );
+        setLog(
+          [res.data.opensre?.hint, JSON.stringify(res.data, null, 2)]
+            .filter(Boolean)
+            .join("\n\n")
+        );
       }
     } catch (e) {
       setError(e.message);
@@ -244,8 +275,14 @@ export default function Chaos() {
             (summary ? `\n\nCoreDNS summary: health=${summary.health_status} probe=${summary.probe_verdict} SERVFAIL=${summary.servfail} timeouts=${summary.dns_timeouts}` : "")
         );
       } else {
-        setError(res.data.error || "CoreDNS action failed");
-        setLog(JSON.stringify(res.data, null, 2));
+        setError(
+          res.data.opensre?.error || res.data.error || "CoreDNS action failed"
+        );
+        setLog(
+          [res.data.opensre?.hint, JSON.stringify(res.data, null, 2)]
+            .filter(Boolean)
+            .join("\n\n")
+        );
       }
     } catch (e) {
       setError(e.message);
@@ -289,8 +326,14 @@ export default function Chaos() {
             (summary ? `\n\nELK summary: ${JSON.stringify(summary)}` : "")
         );
       } else {
-        setError(res.data.error || "ELK action failed");
-        setLog(JSON.stringify(res.data, null, 2));
+        setError(
+          res.data.opensre?.error || res.data.error || "ELK action failed"
+        );
+        setLog(
+          [res.data.opensre?.hint, JSON.stringify(res.data, null, 2)]
+            .filter(Boolean)
+            .join("\n\n")
+        );
       }
     } catch (e) {
       setError(e.message);
@@ -405,7 +448,7 @@ export default function Chaos() {
         >
           <div className="row">
             <div className="health-item__icon"><Database size={16} /></div>
-            <div className="text-muted" style={{ fontSize: 13 }}>local container</div>
+            <div className="text-muted" style={{ fontSize: 13 }}>Kubernetes StatefulSet (databases/aerospike-0)</div>
           </div>
         </Card>
 
@@ -415,7 +458,7 @@ export default function Chaos() {
         >
           <div className="row">
             <div className="health-item__icon"><HardDrive size={16} /></div>
-            <div className="text-muted" style={{ fontSize: 13 }}>local container</div>
+            <div className="text-muted" style={{ fontSize: 13 }}>Kubernetes StatefulSet (databases/yugabytedb-0)</div>
           </div>
         </Card>
 
@@ -427,6 +470,93 @@ export default function Chaos() {
             <div className="health-item__icon"><Server size={16} /></div>
             <div className="text-muted" style={{ fontSize: 13 }}>
               opensre-demo-worker · {broken} of {(status?.pods || []).length} pods degraded
+            </div>
+          </div>
+        </Card>
+      </div>
+
+      {/* Database Failure Injection Section */}
+      <div style={{ marginBottom: "var(--space-4)" }}>
+        <Card
+          title="Database Failure Injection"
+          subtitle="Inject realistic database incidents into K8s-deployed YugabyteDB & Aerospike, then investigate with OpenSRE"
+          actions={
+            loading ? <Loader2 size={14} className="btn__spinner" /> : (
+              <>
+                <span className="text-muted" style={{ fontSize: 12, marginRight: "var(--space-2)" }}>YugabyteDB:</span>
+                {stateBadge(status?.containers?.yugabyte)}
+                <span className="text-muted" style={{ fontSize: 12, marginLeft: "var(--space-2)", marginRight: "var(--space-2)" }}>Aerospike:</span>
+                {stateBadge(status?.containers?.aerospike)}
+              </>
+            )
+          }
+        >
+          <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
+            <div>
+              <div className="text-muted" style={{ fontSize: 13, marginBottom: "var(--space-2)" }}>
+                <HardDrive size={13} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                YugabyteDB
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                  gap: "var(--space-2)",
+                }}
+              >
+                {FAILURES.filter(f => f.category === "database" && f.label.includes("Yugabyte")).map((f) => (
+                  <button
+                    key={f.action}
+                    className="btn btn--primary btn--sm"
+                    onClick={() => runAction("inject", f.action, f.label)}
+                    disabled={running !== null}
+                    style={{ justifyContent: "space-between" }}
+                    title={f.desc}
+                  >
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <f.icon size={14} />
+                      {f.label}
+                    </span>
+                    {running === `inject:${f.action}` && <Loader2 size={13} className="btn__spinner" />}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-muted" style={{ fontSize: 13, marginBottom: "var(--space-2)" }}>
+                <Database size={13} style={{ verticalAlign: "middle", marginRight: 4 }} />
+                Aerospike
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+                  gap: "var(--space-2)",
+                }}
+              >
+                {FAILURES.filter(f => f.category === "database" && f.label.includes("Aerospike")).map((f) => (
+                  <button
+                    key={f.action}
+                    className="btn btn--primary btn--sm"
+                    onClick={() => runAction("inject", f.action, f.label)}
+                    disabled={running !== null}
+                    style={{ justifyContent: "space-between" }}
+                    title={f.desc}
+                  >
+                    <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                      <f.icon size={14} />
+                      {f.label}
+                    </span>
+                    {running === `inject:${f.action}` && <Loader2 size={13} className="btn__spinner" />}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div style={{ marginTop: "var(--space-2)", paddingTop: "var(--space-2)", borderTop: "1px solid var(--border)" }}>
+              <div className="text-muted" style={{ fontSize: 12 }}>
+                Flow: Inject failure → Database becomes unhealthy → Click "Investigate with OpenSRE" on the YugabyteDB/Aerospike pages
+                or use the Incident page → OpenSRE collects DB + K8s + Metrics + Logs evidence → Evidence-grounded RCA → Click Recover
+              </div>
             </div>
           </div>
         </Card>
@@ -756,30 +886,40 @@ export default function Chaos() {
           }
         >
           <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-3)" }}>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
-                gap: "var(--space-3)",
-              }}
-            >
-              {FAILURES.map((f) => (
-                <button
-                  key={f.action}
-                  className="btn btn--primary btn--sm"
-                  onClick={() => runAction("inject", f.action, f.label)}
-                  disabled={running !== null}
-                  style={{ justifyContent: "space-between" }}
-                  title={f.desc}
-                >
-                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
-                    <f.icon size={14} />
-                    {f.label}
-                  </span>
-                  {running === `inject:${f.action}` && <Loader2 size={13} className="btn__spinner" />}
-                </button>
-              ))}
+            <div className="text-muted" style={{ fontSize: 12 }}>
+              Database, CoreDNS and ELK faults live in their dedicated cards above — this grid covers the rest, grouped by category.
             </div>
+            {GENERIC_CATEGORIES.map((group) => (
+              <div key={group.id}>
+                <div className="text-muted" style={{ fontSize: 13, marginBottom: "var(--space-2)" }}>
+                  {group.title} <span style={{ opacity: 0.7 }}>· {group.hint}</span>
+                </div>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+                    gap: "var(--space-3)",
+                  }}
+                >
+                  {FAILURES.filter((f) => f.category === group.id).map((f) => (
+                    <button
+                      key={f.action}
+                      className="btn btn--primary btn--sm"
+                      onClick={() => runAction("inject", f.action, f.label)}
+                      disabled={running !== null}
+                      style={{ justifyContent: "space-between" }}
+                      title={f.desc}
+                    >
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <f.icon size={14} />
+                        {f.label}
+                      </span>
+                      {running === `inject:${f.action}` && <Loader2 size={13} className="btn__spinner" />}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
 
             <div style={{ marginTop: "var(--space-3)" }}>
               <button
@@ -931,7 +1071,7 @@ export default function Chaos() {
               disabled={gdRunning}
               style={{ minWidth: 220 }}
             >
-              {FAILURES.map((f) => (
+              {GAMEDAY_FAULTS.map((f) => (
                 <option key={f.action} value={f.action}>{f.label}</option>
               ))}
             </select>

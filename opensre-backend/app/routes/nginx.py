@@ -73,7 +73,7 @@ def nginx_investigate(context: str | None = Query(default=None), tail: int = Que
         return evidence_result
     evidence = evidence_result["evidence"]
     # Add explicit question for the LLM to anchor the RCA
-    nginx_summary = evidence.get("nginx", {}).get("summary", {}) or {}
+    nginx_summary = (evidence.get("nginx") or {}).get("summary", {}) or {}
     evidence["question"] = (
         "Investigate this Nginx reverse-proxy for failures. "
         f"Summary: 5xx={nginx_summary.get('http_5xx', '?')}, "

@@ -123,10 +123,11 @@ def investigate_pod(
         "stdout": cli_result.get("stdout"),
         "stderr": cli_result.get("stderr"),
         "returncode": cli_result.get("returncode"),
+        "incident_id": cli_result.get("incident_id"),
         # VictoriaMetrics pod metrics (request rate, error rate, latency percentiles)
-        "vm_metrics": evidence_result.get("evidence", {}).get("metrics", {}).get("pod", {}),
+        "vm_metrics": ((evidence_result.get("evidence") or {}).get("metrics") or {}).get("pod", {}),
         # Elasticsearch log signals (ERROR/EXCEPTION/TIMEOUT counts + sample logs)
-        "es_signals": evidence_result.get("evidence", {}).get("elasticsearch", {}),
+        "es_signals": (evidence_result.get("evidence") or {}).get("elasticsearch", {}) or {},
     }
     return enriched
 
@@ -191,7 +192,7 @@ def investigate_elk(
     if not evidence_result.get("success"):
         return evidence_result
     evidence = evidence_result["evidence"]
-    summ = evidence.get("elasticsearch", {}).get("summary", {}) or {}
+    summ = (evidence.get("elasticsearch") or {}).get("summary", {}) or {}
     evidence["question"] = (
         "Investigate ELK/Evidence layer for ERROR/EXCEPTION/FAILED/"
         "CONNECTION REFUSED/TIMEOUT patterns. "
@@ -231,7 +232,7 @@ def chat(request: ChatRequest):
         # Add the user's actual question to the evidence.
         evidence["question"] = request.message
 
-        return opensre_cli.investigate(evidence)
+        return opensre_cli.investigate(evidence, source="chat")
 
     # If a pod is selected, collect real Kubernetes evidence
     # from the selected cluster before sending the request to OpenSRE.
@@ -250,7 +251,7 @@ def chat(request: ChatRequest):
         # Add the user's actual question to the evidence.
         evidence["question"] = request.message
 
-        return opensre_cli.investigate(evidence)
+        return opensre_cli.investigate(evidence, source="chat")
 
     # Fallback when no pod is selected.
     return opensre_cli.chat(

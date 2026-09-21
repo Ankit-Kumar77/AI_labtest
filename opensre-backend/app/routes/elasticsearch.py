@@ -137,7 +137,7 @@ def elk_investigate(
         return es_evidence_result
     evidence = es_evidence_result["evidence"]
 
-    summ = evidence.get("elasticsearch", {}).get("summary", {}) or {}
+    summ = (evidence.get("elasticsearch") or {}).get("summary", {}) or {}
     evidence["question"] = (
         "Investigate this ELK/Evidence layer for ERROR/EXCEPTION/FAILED/CONNECTION REFUSED/TIMEOUT patterns. "
         f"Error summary: {summ}. "

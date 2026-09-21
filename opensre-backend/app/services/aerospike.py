@@ -24,7 +24,44 @@ def health():
         client.close()
         return {"success": True, "status": "connected"}
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        out = {"success": False, "error": str(e)}
+        hint = _port_forward_hint("aerospike")
+        if hint:
+            out["hint"] = hint["hint"]
+            out["port_forward"] = hint["port_forward"]
+        return out
+
+
+def _port_forward_hint(target: str):
+    """Detect the 'pod Running but backend unreachable' case.
+
+    The backend reaches K8s databases via `kubectl port-forward`, which
+    dies whenever the StatefulSet scales to 0 (chaos down/fail). After a
+    recover the pod is Running again but the forward is gone, so health
+    stays red until the forward is restarted. Surface that explicitly.
+    """
+    try:
+        from app.services import containers
+
+        state = containers.container_state(target)
+    except Exception:
+        return None
+    if state.get("success") and state.get("running"):
+        cmd = (
+            "kubectl port-forward -n databases svc/aerospike 3001:3000"
+            if target == "aerospike"
+            else "kubectl port-forward -n databases svc/yugabytedb 5433:5433"
+        )
+        return {
+            "hint": (
+                "Database pod is Running in Kubernetes but unreachable "
+                "from the backend — the kubectl port-forward is down "
+                "(it dies when the StatefulSet scales to 0). Restart it, "
+                "then re-check health. Do NOT use docker start."
+            ),
+            "port_forward": cmd,
+        }
+    return None
 
 
 def query(namespace: str, set_name: str, key: str):

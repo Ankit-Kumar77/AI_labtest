@@ -18,6 +18,7 @@ The project demonstrates how modern observability tools can be integrated with A
 - Grafana
 - Aerospike Database
 - YugabyteDB Database
+- **Elasticsearch & Kibana (ELK Stack for Logs)**
 
 ### Backend
 
@@ -92,6 +93,9 @@ The project demonstrates how modern observability tools can be integrated with A
 | Metrics Collection | vmagent |
 | Telemetry | OpenTelemetry Collector |
 | Visualization | Grafana |
+| **Log Storage** | **Elasticsearch** |
+| **Log Visualization** | **Kibana** |
+| Log Shipper | Fluent Bit |
 | NoSQL Database | Aerospike |
 | Distributed SQL Database | YugabyteDB |
 | Source Control Integration | GitHub API |
@@ -119,15 +123,19 @@ opensre-demo/
 │   └── k8s/
 │
 ├── observability/
-│   ├── otel-values.yaml
+│   ├── install.sh              # Full stack installer (metrics + logs)
+│   ├── vm-values.yaml
 │   ├── vmagent-values.yaml
-│   └── grafana-values.yaml
+│   ├── grafana-values.yaml
+│   ├── otel-values.yaml
+│   ├── es-values.yaml          # Elasticsearch Helm values
+│   └── fluent-bit.yaml         # Fluent Bit DaemonSet
 │
 ├── chaos/
 │   ├── runbook.sh
 │   └── README.md
 │
-├── docker-compose.yml
+├── docker-compose.yml          # Local databases + ELK stack
 │
 └── README.md
 ```
@@ -274,6 +282,8 @@ run it again — it uses `helm upgrade --install`.
 | `open-telemetry/opentelemetry-collector` | `0.172.0` | `observability/otel-values.yaml` |
 | `prometheus-community/kube-state-metrics` | `8.4.1` | (defaults) |
 | `prometheus-community/prometheus-node-exporter` | `4.56.3` | (defaults) |
+| `elastic/elasticsearch` | `8.5.1` | `observability/es-values.yaml` |
+| `elastic/kibana` | `8.5.1` | (values in install.sh) |
 
 `vm-values.yaml` keeps the single-node VictoriaMetrics at **1-day
 retention** (`retentionPeriod: "1"`), a **16 Gi persistent volume**, and
@@ -314,6 +324,57 @@ If you are running an older cluster (created before the port mapping), reach Gra
 ```bash
 kubectl port-forward -n observability svc/grafana 3000:80
 ```
+
+---
+
+## ELK Stack (Elasticsearch + Kibana + Fluent Bit)
+
+The observability stack includes a full ELK stack for log aggregation and visualization. Deploy it using the install script (recommended):
+
+```bash
+./observability/install.sh
+```
+
+This single script installs/upgrades the entire observability stack including:
+- **VictoriaMetrics** (metrics storage)
+- **Grafana** (metrics visualization)
+- **OpenTelemetry Collector** (telemetry collection)
+- **vmagent** (metrics scraping)
+- **Elasticsearch** (log storage) - single-node demo cluster
+- **Kibana** (log visualization) - exposed on NodePort 30001 (mapped to localhost:3001 via Kind)
+- **Fluent Bit** (log shipper) - DaemonSet that tails container logs and ships to Elasticsearch
+
+The install script is idempotent and safe to re-run. It also:
+- Creates an ILM policy for log retention (hot 1d, warm 7d, delete 30d)
+- Creates an index template for `logs-opensre-*` indices
+- Creates a Kibana index pattern and sets it as default
+
+To install ELK components individually:
+
+```bash
+# Elasticsearch
+helm install opensre-es elastic/elasticsearch \
+  -n observability \
+  --version 8.5.1 \
+  -f observability/es-values.yaml
+
+# Kibana (after Elasticsearch is ready)
+helm install opensre-kibana elastic/kibana \
+  -n observability \
+  --version 8.5.1 \
+  --set service.type=NodePort \
+  --set service.nodePort=30001 \
+  --set elasticsearchHosts="http://opensre-es-master:9200" \
+  --no-hooks
+
+# Fluent Bit
+kubectl apply -f observability/fluent-bit.yaml
+```
+
+Access URLs (via Kind port mappings):
+- **Elasticsearch**: http://localhost:9200
+- **Kibana**: http://localhost:3001
+- **Logs Explorer (Frontend)**: http://localhost:5173/logs
 
 ---
 
@@ -361,6 +422,9 @@ grafana
 victoriametrics
 otel-collector
 vmagent
+opensre-es-master-0
+opensre-kibana-xxx
+fluent-bit-xxx
 ```
 
 All pods should be in the **Running** state.
@@ -453,23 +517,60 @@ http://localhost:5173
 
 ---
 
-## Start the Databases (Aerospike & YugabyteDB)
+## Start the Databases (Aerospike, YugabyteDB, Elasticsearch & Kibana)
 
-The backend connects to Aerospike and YugabyteDB for the database analytics pages. Start them with Docker Compose:
+### Elasticsearch & Kibana (Local via Docker Compose)
+The backend connects to Elasticsearch for the Logs Explorer. Start them with Docker Compose:
 
 ```bash
-docker compose up -d
+docker compose up -d elasticsearch kibana
 ```
 
 Or with Podman:
-
 ```bash
-podman run -d --name aerospike -p 3001:3000 docker.io/aerospike/aerospike-server
-podman run -d --name yugabyte --network host docker.io/yugabytedb/yugabyte \
-  bin/yugabyted start --daemon=false --listen=0.0.0.0
+podman run -d --name elasticsearch -p 9200:9200 -p 9300:9300 \
+  -e "discovery.type=single-node" -e "xpack.security.enabled=false" \
+  -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+  -v elasticsearch-data:/usr/share/elasticsearch/data \
+  docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+podman run -d --name kibana -p 5601:5601 \
+  -e "ELASTICSEARCH_HOSTS=http://elasticsearch:9200" \
+  docker.elastic.co/kibana/kibana:8.15.0
 ```
 
-YugabyteDB's YSQL (PostgreSQL-compatible API) listens on `localhost:5433` and Aerospike on `localhost:3001`.
+Elasticsearch on `localhost:9200`, Kibana on `localhost:5601`.
+
+### YugabyteDB & Aerospike (Running in Kubernetes — NO docker start)
+**Important**: YugabyteDB and Aerospike run as StatefulSets inside the Kind Kubernetes cluster (namespace `databases`). Do NOT use `docker start yugabyte/aerospike` — those containers are deleted and the dashboard no longer reads docker state.
+
+Deploy them:
+
+```bash
+kubectl apply -f infra/k8s/yugabytedb/
+kubectl apply -f infra/k8s/aerospike/
+kubectl get pods -n databases
+# yugabytedb-0 1/1 Running, aerospike-0 1/1 Running
+# (YugabyteDB takes ~2-3 min on first start)
+```
+
+This creates:
+- YugabyteDB StatefulSet (1 replica) with services `yugabytedb.databases.svc.cluster.local:5433` (YSQL) and `:9042` (YCQL)
+- Aerospike StatefulSet (1 replica) with service `aerospike.databases.svc.cluster.local:3000`
+
+The backend runs outside the cluster, so it reaches K8s DBs via port-forwards (start before backend):
+
+```bash
+kubectl port-forward -n databases svc/yugabytedb 5433:5433
+kubectl port-forward -n databases svc/aerospike 3001:3000
+```
+
+`.env` is already set for this (`YUGABYTE_HOST=127.0.0.1:5433`, `AEROSPIKE_HOSTS=127.0.0.1:3001`).
+
+To verify database connectivity from the backend:
+```bash
+curl http://localhost:8001/api/yugabyte/health
+curl http://localhost:8001/api/aerospike/health
+```
 
 ---
 
@@ -495,25 +596,83 @@ Aerospike, and the Kubernetes cluster so they can be observed and analyzed live
 through the OpenSRE dashboard. See [`chaos/README.md`](chaos/README.md) for the
 full guide.
 
+## Database Failure Injection (New!)
+
+YugabyteDB and Aerospike now run as StatefulSets in Kubernetes. The Chaos Engineering dashboard provides a **Database Failure Injection** section to inject realistic database incidents and investigate them with OpenSRE.
+
+### Five Database Incident Scenarios
+
+| Scenario | Inject Action | Recover Action | Description |
+|----------|--------------|----------------|-------------|
+| **YugabyteDB Unavailable** | `yugabyte-unavailable` | `yugabyte-up` | Scales YugabyteDB StatefulSet to 0 replicas |
+| **YugabyteDB High Latency** | `yugabyte-latency` | `yugabyte-latency-recover` | Induces slow queries via heavy workload |
+| **YugabyteDB Connection Pressure** | `yugabyte-connection-pressure` | `yugabyte-connection-pressure-recover` | Simulates connection pool exhaustion |
+| **Aerospike Unavailable** | `aerospike-unavailable` | `aerospike-up` | Scales Aerospike StatefulSet to 0 replicas |
+| **Aerospike High Latency** | `aerospike-latency` | `aerospike-latency-recover` | Induces slow operations via heavy workload |
+
+### UI-Driven Workflow (No Terminal Required)
+
+1. **Open the Chaos page** → `http://localhost:5173/chaos`
+2. **Navigate to "Database Failure Injection"** section
+3. **Click "Inject"** on any scenario (e.g., "YugabyteDB Unavailable")
+4. **Watch the database health flip to "Unreachable"** on the YugabyteDB/Aerospike pages
+5. **Click "Investigate with OpenSRE"** on the database page or Incident page
+6. **OpenSRE automatically gathers evidence** from:
+   - Database (health, connections, slow queries, errors, replication)
+   - Kubernetes (pod state, events, logs)
+   - VictoriaMetrics (metrics, latency, error rates)
+   - Elasticsearch (logs, ERROR/EXCEPTION/TIMEOUT signals)
+   - GitHub (recent commits if relevant)
+7. **OpenSRE correlates evidence** and produces evidence-grounded RCA with:
+   - Root Cause
+   - Supporting Evidence
+   - Impact
+   - Timeline
+   - Recommendation
+   - Confidence (High/Medium/Low)
+8. **Click "Recover"** to restore the database to healthy state
+
+### CLI Access (Alternative)
+
 ```bash
-# Show current state (read-only)
+# Show current state
 ./chaos/runbook.sh status
 
-# Inject a failure
-./chaos/runbook.sh aerospike-down       # Aerospike container down
-./chaos/runbook.sh yugabyte-down        # YugabyteDB container down
-./chaos/runbook.sh pod-crash            # Crash catalog-api container (real restart)
-./chaos/runbook.sh pod-cpu              # CPU spike in catalog-api pod
-./chaos/runbook.sh pod-memory           # Memory spike in catalog-api pod
-./chaos/runbook.sh pod-latency          # +5s extra latency on catalog-api traffic
-./chaos/runbook.sh flaky-latency        # +3s extra latency on flaky-service traffic
-./chaos/runbook.sh node-network-latency # 500ms netem delay on worker node egress
-./chaos/runbook.sh system-pod-kill      # Kill a kube-system pod (self-healing)
-./chaos/runbook.sh node-cordon          # Cordon the worker node
-./chaos/runbook.sh node-drain           # Drain the worker node
+# Inject database failures
+./chaos/runbook.sh yugabyte-unavailable      # YugabyteDB unavailable (K8s)
+./chaos/runbook.sh yugabyte-latency          # YugabyteDB high latency
+./chaos/runbook.sh yugabyte-connection-pressure  # YugabyteDB connection pressure
+./chaos/runbook.sh aerospike-unavailable     # Aerospike unavailable (K8s)
+./chaos/runbook.sh aerospike-latency         # Aerospike high latency
+
+# Inject other failures (existing)
+./chaos/runbook.sh pod-crash
+./chaos/runbook.sh pod-cpu
+./chaos/runbook.sh pod-latency
+./chaos/runbook.sh coredns-down
+./chaos/runbook.sh node-network-latency
+# ... etc
 
 # Recover
+./chaos/runbook.sh recover yugabyte-up
+./chaos/runbook.sh recover yugabyte-latency-recover
+./chaos/runbook.sh recover yugabyte-connection-pressure-recover
+./chaos/runbook.sh recover aerospike-up
+./chaos/runbook.sh recover aerospike-latency-recover
 ./chaos/runbook.sh recover all
+```
+
+### OpenSRE Investigation API
+
+```bash
+# Investigate a database directly
+curl -X POST http://localhost:8001/api/opensre/investigate \
+  -H "Content-Type: application/json" \
+  -d '{"alert_payload": "{\"labels\": {\"alertname\": \"YugabyteDown\", \"database\": \"yugabyte\"}}"}'
+
+# Or use the database investigation endpoint
+curl http://localhost:8001/api/investigation/evidence/target/yugabyte
+curl http://localhost:8001/api/investigation/evidence/target/aerospike
 ```
 
 > **Latency spike**: `pod-latency` and `flaky-latency` call the target service's
@@ -524,7 +683,7 @@ full guide.
 > `flaky-latency-off`. `node-network-latency` applies a `netem` 500ms egress
 > delay on the worker node (`NODE_LATENCY_MS` to override), which lifts every
 > in-cluster caller's latency; recover with `network-latency-off`.
-
+>
 > **Game-day**: run an automated steady-state experiment from the **Chaos** page
 > (Game-day card) or via the API — baseline → inject → hold ≥ 60s → measure →
 > recover → report, with a degraded/recovered verdict. Every inject/recover
@@ -864,6 +1023,18 @@ Grafana:
 http://localhost:3000
 ```
 
+Elasticsearch:
+
+```
+http://localhost:9200
+```
+
+Kibana:
+
+```
+http://localhost:3001
+```
+
 OpenSRE:
 
 ```bash
@@ -1047,7 +1218,6 @@ Screenshots of the application will be added after the dashboard UI is finalized
 - AI-powered incident investigation
 - One-click root cause analysis
 - AlertManager integration
-- Log aggregation with Loki
 - Historical incident timeline
 - Dashboard charts and graphs
 - Authentication & RBAC
@@ -1065,12 +1235,16 @@ Screenshots of the application will be added after the dashboard UI is finalized
 - ✔ vmagent
 - ✔ OpenTelemetry Collector
 - ✔ Grafana
+- ✔ **Elasticsearch (ELK Stack)**
+- ✔ **Kibana (Log Visualization)**
+- ✔ **Fluent Bit (Log Shipper)**
 - ✔ Kubernetes REST APIs
 - ✔ OpenSRE CLI Integration
 - ✔ Aerospike Connector
 - ✔ YugabyteDB Connector
 - ✔ GitHub Integration
 - ✔ Live Latency Page (p50/p95/p99)
+- ✔ **Logs Explorer with Elasticsearch/Kibana**
 
 ---
 

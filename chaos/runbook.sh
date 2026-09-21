@@ -236,17 +236,13 @@ es_check() {
 
 # ---------- Failure: Aerospike down ----------------------------------------
 aerospike_down() {
-  banner "Injecting failure: AEROSPIKE DOWN"
-  step "Killing the Aerospike container"
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^aerospike$'; then
-    docker stop aerospike
-    ok "Aerospike container stopped"
-    local id
-    id="$(exp_record inject aerospike-down aerospike "" "container stopped")"
-    exp_active_add aerospike-down "${id}" "container stopped"
-  else
-    warn "No 'aerospike' container found — nothing to do"
-  fi
+  banner "Injecting failure: AEROSPIKE UNAVAILABLE (K8s)"
+  step "Scaling Aerospike StatefulSet to 0 replicas"
+  kubectl --context "${CLUSTER}" scale statefulset aerospike -n databases --replicas=0
+  ok "Aerospike scaled to 0 — pod terminated"
+  local id
+  id="$(exp_record inject aerospike-down aerospike "" "statefulset scaled to 0")"
+  exp_active_add aerospike-down "${id}" "statefulset scaled to 0"
   echo
   echo "  >>> Open the Aerospike page in the dashboard — health should flip to"
   echo "      'Unreachable' and scans/queries will error out."
@@ -256,17 +252,13 @@ aerospike_down() {
 
 # ---------- Failure: Yugabyte down -----------------------------------------
 yugabyte_down() {
-  banner "Injecting failure: YUGABYTE DOWN"
-  step "Killing the YugabyteDB container"
-  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^yugabyte$'; then
-    docker stop yugabyte
-    ok "YugabyteDB container stopped"
-    local id
-    id="$(exp_record inject yugabyte-down yugabyte "" "container stopped")"
-    exp_active_add yugabyte-down "${id}" "container stopped"
-  else
-    warn "No 'yugabyte' container found — nothing to do"
-  fi
+  banner "Injecting failure: YUGABYTE UNAVAILABLE (K8s)"
+  step "Scaling YugabyteDB StatefulSet to 0 replicas"
+  kubectl --context "${CLUSTER}" scale statefulset yugabytedb -n databases --replicas=0
+  ok "YugabyteDB scaled to 0 — pod terminated"
+  local id
+  id="$(exp_record inject yugabyte-down yugabyte "" "statefulset scaled to 0")"
+  exp_active_add yugabyte-down "${id}" "statefulset scaled to 0"
   echo
   echo "  >>> Open the YugabyteDB page in the dashboard — health should flip to"
   echo "      'Unreachable' and SQL queries will fail with a connection error."
@@ -655,17 +647,6 @@ elk_timeout() {
   echo "  >>> Also check Kibana Discover for chaos_experiment_id=$id"
   echo "  >>> Then run './chaos/runbook.sh recover elk-recover' to clear state"
 }
-  kubectl --context "${CLUSTER}" exec -n "${CATALOG_NS}" "${pod}" -- \
-    python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/failure/timed-out', timeout=10)" \
-    >/dev/null 2>&1 || true
-  ok "TIMEOUT/TIMED OUT log signal injected — Fluent Bit forwards to Elasticsearch"
-  local id
-  id="$(exp_record inject elk-timeout "${pod}" "" "TIMEOUT log signal")"
-  exp_active_add elk-timeout "${id}" ""
-  echo
-  echo "  >>> Check Elasticsearch: 'logs-*' index for TIMEOUT/TIMED OUT logs"
-  echo "  >>> Then run './chaos/runbook.sh recover elk-recover' to clear state"
-}
 
 elk_recover() {
   banner "Recovery: CLEAR ELK DEMO FAILURE STATE"
@@ -724,27 +705,25 @@ recover() {
 
   case "${target}" in
     aerospike-up)
-      step "Starting Aerospike container"
-      docker start aerospike >/dev/null 2>&1 || true
-      sleep 2
-      if container_up aerospike; then
-        ok "Aerospike running"
-        id="$(exp_record recover aerospike-up aerospike "" "container restarted")"
+      step "Scaling Aerospike StatefulSet to 1 replica"
+      kubectl --context "${CLUSTER}" scale statefulset aerospike -n databases --replicas=1
+      if kubectl --context "${CLUSTER}" rollout status statefulset/aerospike -n databases --timeout=120s; then
+        ok "Aerospike running (1 replica, rollout complete)"
+        id="$(exp_record recover aerospike-up aerospike "" "statefulset scaled to 1")"
         exp_active_remove aerospike-down
       else
-        fail "Aerospike failed to start"; return 1
+        fail "Aerospike rollout did not complete"; return 1
       fi
       ;;
     yugabyte-up)
-      step "Starting YugabyteDB container"
-      docker start yugabyte >/dev/null 2>&1 || true
-      sleep 2
-      if container_up yugabyte; then
-        ok "YugabyteDB running"
-        id="$(exp_record recover yugabyte-up yugabyte "" "container restarted")"
+      step "Scaling YugabyteDB StatefulSet to 1 replica"
+      kubectl --context "${CLUSTER}" scale statefulset yugabytedb -n databases --replicas=1
+      if kubectl --context "${CLUSTER}" rollout status statefulset/yugabytedb -n databases --timeout=180s; then
+        ok "YugabyteDB running (1 replica, rollout complete)"
+        id="$(exp_record recover yugabyte-up yugabyte "" "statefulset scaled to 1")"
         exp_active_remove yugabyte-down
       else
-        fail "YugabyteDB failed to start"; return 1
+        fail "YugabyteDB rollout did not complete"; return 1
       fi
       ;;
     latency-off)
@@ -851,12 +830,8 @@ except Exception:
 show_status() {
   banner "CURRENT DEMO STATE"
 
-  echo "--- Containers ---"
-  if command -v docker &>/dev/null; then
-    docker ps -a --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null | grep -iE "NAME|aero|yuga" || true
-  else
-    podman ps -a --format 'table {{.Names}}\t{{.Status}}' 2>/dev/null | grep -iE "NAME|aero|yuga" || true
-  fi
+  echo "--- Databases (Kubernetes StatefulSets, namespace/databases) ---"
+  kubectl --context "${CLUSTER}" get pods -n databases -o wide 2>/dev/null || warn "databases namespace not found — apply infra/k8s/yugabytedb + infra/k8s/aerospike"
 
   echo
   echo "--- Nodes ---"
@@ -872,15 +847,18 @@ show_status() {
 
   echo
   echo "--- Sign of life checks ---"
-  if (command docker ps 2>/dev/null || command podman ps 2>/dev/null) | grep -q aerospike; then
-    ok "Aerospike: RUNNING"
+  local aero_ready yb_ready
+  aero_ready=$(kubectl --context "${CLUSTER}" get pod aerospike-0 -n databases -o jsonpath='{.status.phase}:{.status.containerStatuses[0].ready}' 2>/dev/null || echo "missing")
+  yb_ready=$(kubectl --context "${CLUSTER}" get pod yugabytedb-0 -n databases -o jsonpath='{.status.phase}:{.status.containerStatuses[0].ready}' 2>/dev/null || echo "missing")
+  if [[ "${aero_ready}" == "Running:true" ]]; then
+    ok "Aerospike (K8s databases/aerospike-0): RUNNING"
   else
-    fail "Aerospike: DOWN"
+    fail "Aerospike (K8s databases/aerospike-0): ${aero_ready:-DOWN} — no docker start needed, use kubectl/chaos recover"
   fi
-  if (command docker ps 2>/dev/null || command podman ps 2>/dev/null) | grep -q yugabyte; then
-    ok "Yugabyte: RUNNING"
+  if [[ "${yb_ready}" == "Running:true" ]]; then
+    ok "YugabyteDB (K8s databases/yugabytedb-0): RUNNING"
   else
-    fail "Yugabyte: DOWN"
+    fail "YugabyteDB (K8s databases/yugabytedb-0): ${yb_ready:-DOWN} — no docker start needed, use kubectl/chaos recover"
   fi
   local node_state
   node_state=$(kubectl --context "${CLUSTER}" get nodes "${WORKER_NODE}" --no-headers 2>/dev/null | awk '{print $2}' || true)
@@ -914,6 +892,84 @@ sys.exit(0 if fault in data else 1)
 ' "$fault" "${EXPERIMENTS_DIR}/active.json" 2>/dev/null
 }
 
+# ---------- Failure: YugabyteDB High Latency ---------------------------------
+yugabyte_latency() {
+  banner "Injecting failure: YUGABYTE HIGH LATENCY"
+  step "Inducing query latency via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/latency/induce" \
+    -H "Content-Type: application/json" -d '{"target": "yugabyte"}' || true)
+  ok "YugabyteDB latency induced via heavy queries"
+  local id
+  id="$(exp_record inject yugabyte-latency yugabyte "" "heavy queries induced")"
+  exp_active_add yugabyte-latency "${id}" "heavy queries"
+  echo
+  echo "  >>> Query latency should increase — check the YugabyteDB page and Metrics."
+  echo "  >>> Then run './chaos/runbook.sh recover yugabyte-latency-recover' to clear it."
+}
+
+yugabyte_latency_recover() {
+  banner "Recovery: CLEAR YUGABYTE LATENCY"
+  step "Cleaning up latency-inducing data via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/latency/recover" \
+    -H "Content-Type: application/json" -d '{"target": "yugabyte"}' || true)
+  ok "YugabyteDB latency test data cleaned up"
+  exp_active_remove yugabyte-latency
+}
+
+# ---------- Failure: YugabyteDB Connection Pressure --------------------------
+yugabyte_connection_pressure() {
+  banner "Injecting failure: YUGABYTE CONNECTION PRESSURE"
+  step "Inducing connection pressure via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/connection-pressure/induce" \
+    -H "Content-Type: application/json" -d '{"target": "yugabyte"}' || true)
+  ok "YugabyteDB connection pressure induced"
+  local id
+  id="$(exp_record inject yugabyte-connection-pressure yugabyte "" "connection pressure induced")"
+  exp_active_add yugabyte-connection-pressure "${id}" "connection pressure"
+  echo
+  echo "  >>> Connection pool should show pressure — check the YugabyteDB page."
+  echo "  >>> Then run './chaos/runbook.sh recover yugabyte-connection-pressure-recover' to clear it."
+}
+
+yugabyte_connection_pressure_recover() {
+  banner "Recovery: CLEAR YUGABYTE CONNECTION PRESSURE"
+  step "Cleaning up connection pressure data via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/connection-pressure/recover" \
+    -H "Content-Type: application/json" -d '{"target": "yugabyte"}' || true)
+  ok "YugabyteDB connection pressure test data cleaned up"
+  exp_active_remove yugabyte-connection-pressure
+}
+
+# ---------- Failure: Aerospike High Latency ----------------------------------
+aerospike_latency() {
+  banner "Injecting failure: AEROSPIKE HIGH LATENCY"
+  step "Inducing latency via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/latency/induce" \
+    -H "Content-Type: application/json" -d '{"target": "aerospike"}' || true)
+  ok "Aerospike latency induced via heavy operations"
+  local id
+  id="$(exp_record inject aerospike-latency aerospike "" "heavy operations induced")"
+  exp_active_add aerospike-latency "${id}" "heavy operations"
+  echo
+  echo "  >>> Operation latency should increase — check the Aerospike page and Metrics."
+  echo "  >>> Then run './chaos/runbook.sh recover aerospike-latency-recover' to clear it."
+}
+
+aerospike_latency_recover() {
+  banner "Recovery: CLEAR AEROSPIKE LATENCY"
+  step "Cleaning up latency-inducing data via demo API"
+  local resp
+  resp=$(curl -s -X POST "http://localhost:8001/api/demo/db-scenario/latency/recover" \
+    -H "Content-Type: application/json" -d '{"target": "aerospike"}' || true)
+  ok "Aerospike latency test data cleaned up"
+  exp_active_remove aerospike-latency
+}
+
 # ---------- Dispatch -------------------------------------------------------
 main() {
   [[ $# -lt 1 ]] && usage
@@ -923,6 +979,12 @@ main() {
   case "${action}" in
     aerospike-down)   preflight; aerospike_down ;;
     yugabyte-down)    preflight; yugabyte_down ;;
+    yugabyte-latency) preflight; yugabyte_latency ;;
+    yugabyte-latency-recover) preflight; yugabyte_latency_recover ;;
+    yugabyte-connection-pressure) preflight; yugabyte_connection_pressure ;;
+    yugabyte-connection-pressure-recover) preflight; yugabyte_connection_pressure_recover ;;
+    aerospike-latency) preflight; aerospike_latency ;;
+    aerospike-latency-recover) preflight; aerospike_latency_recover ;;
     pod-crash)        preflight; pod_crash ;;
     pod-delete)       preflight; pod_delete ;;
     pod-cpu)          preflight; pod_cpu ;;

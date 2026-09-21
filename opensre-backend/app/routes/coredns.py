@@ -66,7 +66,7 @@ def coredns_investigate(
     if not evidence_result.get("success"):
         return evidence_result
     evidence = evidence_result["evidence"]
-    summary = evidence.get("coredns", {}).get("summary", {}) or {}
+    summary = (evidence.get("coredns") or {}).get("summary", {}) or {}
     evidence["question"] = (
         "Investigate this CoreDNS/DNS layer for latency or resolution "
         "failures. "

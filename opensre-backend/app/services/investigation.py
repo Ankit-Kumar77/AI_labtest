@@ -1164,6 +1164,61 @@ def _alert_target(alert: dict):
     return namespace, pod
 
 
+def _detect_database_alert(alert: dict) -> str | None:
+    """
+    Detect if an alert is related to YugabyteDB or Aerospike.
+    Returns 'yugabyte', 'aerospike', or None.
+    """
+    labels = alert.get("labels") or {}
+    annotations = alert.get("annotations") or {}
+    
+    # Check alertname for database references
+    alertname = labels.get("alertname", "") or annotations.get("alertname", "")
+    alertname_lower = alertname.lower()
+    
+    # Check description/summary for database keywords
+    description = (annotations.get("description", "") or annotations.get("summary", "") or "").lower()
+    summary = (annotations.get("summary", "") or "").lower()
+    
+    # Database-specific keywords
+    yugabyte_keywords = [
+        "yugabyte", "yb-", "ysql", "ycql", "tserver", "master",
+        "pg_", "postgres", "connection refused.*5433", "connection refused.*yugabyte"
+    ]
+    
+    aerospike_keywords = [
+        "aerospike", "asd", "namespace", "aerospike.*connection", 
+        "connection refused.*3000", "proxy_errors", "client_connections"
+    ]
+    
+    # Check all text fields
+    all_text = f"{alertname_lower} {description} {summary}"
+    
+    for keyword in yugabyte_keywords:
+        if keyword in all_text:
+            return "yugabyte"
+    
+    for keyword in aerospike_keywords:
+        if keyword in all_text:
+            return "aerospike"
+    
+    # Check for database label
+    db_label = labels.get("database", "").lower()
+    if db_label in ("yugabyte", "yugabytedb", "yb"):
+        return "yugabyte"
+    if db_label in ("aerospike", "aero"):
+        return "aerospike"
+    
+    # Check for service label
+    service = labels.get("service", "").lower()
+    if "yugabyte" in service:
+        return "yugabyte"
+    if "aerospike" in service:
+        return "aerospike"
+    
+    return None
+
+
 def collect_alert_evidence(
     alert: dict,
     context: str | None = None,
@@ -1190,7 +1245,7 @@ def collect_alert_evidence(
                 evidence = result["evidence"]
                 evidence["target"] = {
                     "type": "nginx",
-                    "namespace": namespace or evidence.get("nginx", {}).get("namespace", "opensre"),
+                    "namespace": namespace or (evidence.get("nginx") or {}).get("namespace", "opensre"),
                     "name": "nginx",
                 }
     except Exception:
@@ -1208,9 +1263,26 @@ def collect_alert_evidence(
                     evidence["target"] = {
                         "type": "coredns",
                         "namespace": namespace
-                        or evidence.get("coredns", {}).get(
+                        or (evidence.get("coredns") or {}).get(
                             "namespace", "kube-system"),
                         "name": "coredns",
+                    }
+        except Exception:
+            pass
+
+    # Database-specific path: database-related alerts get database evidence
+    # Checks for YugabyteDB or Aerospike related alerts
+    if evidence is None:
+        try:
+            db_type = _detect_database_alert(alert)
+            if db_type:
+                result = investigation.collect_database_evidence(db_type)
+                if result.get("success"):
+                    evidence = result["evidence"]
+                    evidence["target"] = {
+                        "type": "database",
+                        "database": db_type,
+                        "name": db_type,
                     }
         except Exception:
             pass
@@ -1428,12 +1500,12 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
 
     # Elasticsearch log signals summary
     es = evidence.get("elasticsearch") or {}
-    if es.get("health", {}).get("success") and es.get("signal_counts", 0) > 0:
+    if (es.get("health") or {}).get("success") and es.get("signal_counts", 0) > 0:
         lines.append(
             f"ES log signals: {es.get('signal_counts')} ERROR/EXCEPTION/TIMEOUT patterns "
             f"(total logs: {es.get('log_total', 0)})"
         )
-    if es.get("health", {}).get("success") and es.get("error") is None and es.get("pod_logs_tail"):
+    if (es.get("health") or {}).get("success") and es.get("error") is None and es.get("pod_logs_tail"):
         sample_lines = es.get("pod_logs_tail", "").splitlines()
         error_signals = [l for l in sample_lines if any(
             tok in l.lower() for tok in ["error", "exception", "timeout", "failed"])]
@@ -1494,12 +1566,12 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
         lines.append(
             f"scrape targets: {vm['scrape_targets_total']} total, "
             f"{vm['scrape_targets_down']} down "
-            f"(health={vm.get('health', {}).get('status')})"
+            f"(health={(vm.get('health') or {}).get('status')})"
         )
 
     if evidence.get("grafana"):
         lines.append(
-            f"grafana health: {evidence['grafana'].get('health', {}).get('status')}"
+            f"grafana health: {(evidence['grafana'].get('health') or {}).get('status')}"
         )
 
     otel = evidence.get("opentelemetry") or {}
@@ -1515,8 +1587,8 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
     nginx = evidence.get("nginx") or {}
     if isinstance(nginx, dict) and (nginx.get("summary") or nginx.get("health_status") or nginx.get("pods")):
         summary = nginx.get("summary") or {}
-        health_status = nginx.get("health_status") or nginx.get("health", {}).get("status") if isinstance(nginx.get("health"), dict) else None
-        cfg_status = nginx.get("config_status") or nginx.get("config_validation", {}).get("valid")
+        health_status = nginx.get("health_status") or (nginx.get("health") or {}).get("status") if isinstance(nginx.get("health"), dict) else None
+        cfg_status = nginx.get("config_status") or (nginx.get("config_validation") or {}).get("valid")
         pods = nginx.get("pods", [])
         if health_status:
             lines.append(f"nginx health: {health_status} (pods={len(pods) if isinstance(pods, list) else '?'})")

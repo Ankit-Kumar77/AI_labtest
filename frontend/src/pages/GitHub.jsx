@@ -18,6 +18,7 @@ import {
   ChevronRight,
   Rocket,
   AlertTriangle,
+  RefreshCw,
 } from "lucide-react";
 
 const TABS = [
@@ -51,6 +52,34 @@ export default function GitHub() {
   const [correlationError, setCorrelationError] = useState(null);
 
   const [selectedRun, setSelectedRun] = useState(null);
+
+  const refreshGitHub = async () => {
+    setChecking(true);
+    try {
+      const [healthRes, repoRes, branchesRes] = await Promise.all([
+        api.get("/github/health"),
+        api.get("/github/repo"),
+        api.get("/github/branches"),
+      ]);
+      const health = healthRes.data;
+      if (health.success) {
+        setStatus("connected");
+      } else {
+        setStatus(health.error || "unreachable");
+      }
+      if (repoRes.data.success) setRepoInfo(repoRes.data.data);
+      if (branchesRes.data.success) {
+        setBranches(branchesRes.data.data || []);
+        if (branchesRes.data.data?.length > 0) {
+          setSelectedBranch(branchesRes.data.data[0]);
+        }
+      }
+    } catch (e) {
+      setStatus(e.message || "backend-offline");
+    } finally {
+      setChecking(false);
+    }
+  };
   const [jobs, setJobs] = useState([]);
   const [jobsLoading, setJobsLoading] = useState(false);
   const [expandedJob, setExpandedJob] = useState(null);
@@ -67,7 +96,12 @@ export default function GitHub() {
           api.get("/github/repo"),
           api.get("/github/branches"),
         ]);
-        setStatus(healthRes.data.success ? "connected" : "unreachable");
+        const health = healthRes.data;
+        if (health.success) {
+          setStatus("connected");
+        } else {
+          setStatus(health.error || "unreachable");
+        }
         if (repoRes.data.success) setRepoInfo(repoRes.data.data);
         if (branchesRes.data.success) {
           setBranches(branchesRes.data.data || []);
@@ -75,8 +109,8 @@ export default function GitHub() {
             setSelectedBranch(branchesRes.data.data[0]);
           }
         }
-      } catch {
-        setStatus("backend-offline");
+      } catch (e) {
+        setStatus(e.message || "backend-offline");
       } finally {
         setChecking(false);
       }
@@ -669,10 +703,22 @@ export default function GitHub() {
           title="Connection"
           subtitle={repoInfo ? `Repository: ${repoInfo.full_name}` : "Configure GITHUB_TOKEN and GITHUB_REPO"}
           actions={
-            <Badge tone={tone}>
-              {checking ? <Loader2 size={12} className="btn__spinner" /> : tone === "success" ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-              {checking ? "Checking…" : label}
-            </Badge>
+            <>
+              <Badge tone={tone}>
+                {checking ? <Loader2 size={12} className="btn__spinner" /> : tone === "success" ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                {checking ? "Checking…" : label}
+              </Badge>
+              {!checking && (
+                <button
+                  onClick={refreshGitHub}
+                  className="btn btn--ghost btn--sm"
+                  title="Re-check GitHub connection"
+                  style={{ marginLeft: "var(--space-2)" }}
+                >
+                  <RefreshCw size={12} />
+                </button>
+              )}
+            </>
           }
         >
           <div className="row">

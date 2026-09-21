@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: yugabytedb
+  namespace: databases
+  labels:
+    app: yugabytedb
+spec:
+  serviceName: yugabytedb-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: yugabytedb
+  template:
+    metadata:
+      labels:
+        app: yugabytedb
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9000"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: yugabytedb
+          image: yugabytedb/yugabyte:2024.2.11.0-b36
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              bin/yugabyted start --listen=0.0.0.0 --insecure --master_flags="ysql_enable_auth=false" --tserver_flags="ysql_enable_auth=false"
+              # Heartbeat: yugabyted is quiet on stdout once running, so Fluent Bit
+              # would ship nothing for this pod and it would vanish from the Logs
+              # explorer. Emit a small YSQL readiness line every minute instead.
+              (while true; do
+                sleep 60
+                if out=$(bin/ysqlsh -U yugabyte -d yugabyte -tAc "SELECT 1" 2>&1); then
+                  echo "[yugabyted-heartbeat] YSQL ready result=${out} pod=$(hostname)"
+                else
+                  echo "[yugabyted-heartbeat] YSQL NOT ready pod=$(hostname) err=$(echo "$out" | head -c 200)"
+                fi
+              done) &
+              # yugabyted daemonizes master/tserver, keep container alive
+              while true; do sleep 30; done
+          env:
+            - name: YB_ENABLED_IN_POSTGRES
+              value: "FLAGS_ysql_yugabytedb_max_connections=300"
+          ports:
+            - containerPort: 5433
+              name: ysql
+            - containerPort: 9042
+              name: ycql
+            - containerPort: 7000
+              name: master-ui
+            - containerPort: 9000
+              name: tserver-ui
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /home/yugabyte/yb_data
+          readinessProbe:
+            exec:
+              command:
+                - bin/yugabyted
+                - status
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - bin/yugabyted
+                - status
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yugabytedb-init-sql
+  namespace: databases
+data:
+  init.sql: |
+    -- Create demo tables for the OpenSRE demo
+    CREATE TABLE IF NOT EXISTS service_instances (
+        id INT PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+    
+    CREATE TABLE IF NOT EXISTS integrity_test (
+        id INT PRIMARY KEY,
+        name TEXT,
+        email TEXT UNIQUE,
+        status TEXT DEFAULT 'active',
+        count INT CHECK (count >= 0)
+    );
+    
+    -- Insert initial demo data
+    INSERT INTO service_instances (id, name) VALUES 
+        (21, 'OrderService-001-instance'),
+        (22, 'OrderService-002-instance'),
+        (23, 'CatalogSync-instance')
+    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name;

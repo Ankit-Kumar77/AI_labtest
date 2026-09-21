@@ -463,7 +463,7 @@ def investigate_nginx(namespace: str | None = None, context: str | None = None, 
         error = agg.get("error", {})
         counts = error.get("counts", {}) if isinstance(error, dict) else {}
         evidence["nginx"]["summary"] = {
-            "total_log_lines": agg.get("access", {}).get("total_lines", 0) + agg.get("error", {}).get("total_lines", 0),
+            "total_log_lines": (agg.get("access") or {}).get("total_lines", 0) + (agg.get("error") or {}).get("total_lines", 0),
             "http_4xx": access.get("http_4xx", 0),
             "http_5xx": access.get("http_5xx", 0),
             "http_502": access.get("http_502", 0),

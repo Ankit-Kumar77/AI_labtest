@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import api from "../api/api";
+import api, { incidentsApi } from "../api/api";
 import Card from "../components/Card";
 import Badge from "../components/Badge";
 import Skeleton from "../components/Skeleton";
@@ -108,6 +108,33 @@ function parseStatusRow(stdout = "") {
   };
 }
 
+function toHistoryEntry(item) {
+  return {
+    id: item.id,
+    timestamp: item.ts,
+    target_type: item.target_type,
+    target_label: item.target_label,
+    namespace: item.namespace,
+    pod: item.pod,
+    cluster: item.cluster,
+    question: item.question,
+    source: item.source,
+    report:
+      item.report && Object.keys(item.report).length ? item.report : null,
+    stdout: item.stdout_preview || "",
+    _previewOnly: true,
+  };
+}
+
+function needsFullRecord(entry) {
+  return (
+    !!entry &&
+    entry._previewOnly &&
+    entry.id != null &&
+    !String(entry.id).startsWith("local-")
+  );
+}
+
 export default function Incident() {
   const [clusters, setClusters] = useSessionState("opensre:clusters", []);
   const [cluster, setCluster] = useSessionState("opensre:cluster", "");
@@ -140,21 +167,137 @@ export default function Incident() {
     []
   );
   const [expandedHistoryIdx, setExpandedHistoryIdx] = useState(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [pendingReportId, setPendingReportId] = useState(null);
 
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Deep-link support: /incident?namespace=<ns>&pod=<name> (e.g. from the
   // Chaos failure-injection page) pre-selects the incident target once.
+  // /incident?report=<id> (e.g. from AI Analysis) expands that history entry.
   useEffect(() => {
     const ns = searchParams.get("namespace");
     const pod = searchParams.get("pod");
+    const rep = searchParams.get("report");
     if (ns || pod) {
       if (ns) setNamespace(ns);
       if (pod) setPodName(pod);
-      setSearchParams({}, { replace: true });
     }
+    if (rep) setPendingReportId(rep);
+    if (ns || pod || rep) setSearchParams({}, { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Persisted history (server-side): every OpenSRE investigation —
+  // including runs from the AI Analysis dashboard — auto-saves here.
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const res = await incidentsApi.list(100);
+      if (res.data?.success) {
+        const serverEntries = (res.data.data || []).map(toHistoryEntry);
+        setInvestigationHistory((prev) => {
+          const prevList = Array.isArray(prev) ? prev : [];
+          const localOnly = prevList.filter(
+            (e) =>
+              e._local &&
+              !serverEntries.some((s) => String(s.id) === String(e.id))
+          );
+          const merged = [...localOnly, ...serverEntries];
+          merged.sort(
+            (a, b) => new Date(b.timestamp) - new Date(a.timestamp)
+          );
+          return merged;
+        });
+      }
+    } catch (err) {
+      console.error("Failed to load incident history:", err);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [setInvestigationHistory]);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  const fetchFullEntry = useCallback(
+    async (entryId) => {
+      try {
+        const res = await incidentsApi.get(entryId);
+        if (res.data?.success && res.data.data) {
+          const full = res.data.data;
+          const fullReport =
+            full.report && Object.keys(full.report).length
+              ? full.report
+              : null;
+          setInvestigationHistory((prev) =>
+            (Array.isArray(prev) ? prev : []).map((e) =>
+              String(e.id) === String(entryId)
+                ? {
+                    ...e,
+                    stdout: full.stdout || e.stdout,
+                    report: e.report || fullReport,
+                    _previewOnly: false,
+                  }
+                : e
+            )
+          );
+        }
+      } catch (err) {
+        console.error("Failed to load incident detail:", err);
+      }
+    },
+    [setInvestigationHistory]
+  );
+
+  function toggleHistoryEntry(idx, entries) {
+    const isExpanded = expandedHistoryIdx === idx;
+    setExpandedHistoryIdx(isExpanded ? null : idx);
+    if (!isExpanded) {
+      const entry = entries[idx];
+      if (needsFullRecord(entry)) fetchFullEntry(entry.id);
+    }
+  }
+
+  // Expand a deep-linked history entry once it has loaded.
+  useEffect(() => {
+    if (!pendingReportId || investigationHistory.length === 0) return;
+    const idx = investigationHistory.findIndex(
+      (e) => String(e.id) === String(pendingReportId)
+    );
+    if (idx < 0) return;
+    setExpandedHistoryIdx(idx);
+    if (needsFullRecord(investigationHistory[idx])) {
+      fetchFullEntry(investigationHistory[idx].id);
+    }
+    setPendingReportId(null);
+  }, [pendingReportId, investigationHistory, fetchFullEntry]);
+
+  async function deleteHistoryEntry(entryId) {
+    setInvestigationHistory((prev) =>
+      (Array.isArray(prev) ? prev : []).filter(
+        (e) => String(e.id) !== String(entryId)
+      )
+    );
+    if (entryId != null && !String(entryId).startsWith("local-")) {
+      try {
+        await incidentsApi.remove(entryId);
+      } catch (err) {
+        console.error("Failed to delete incident:", err);
+        loadHistory();
+      }
+    }
+  }
+
+  async function clearHistory() {
+    try {
+      await incidentsApi.clear();
+    } catch (err) {
+      console.error("Failed to clear incident history:", err);
+    }
+    setInvestigationHistory([]);
+  }
 
   const initialLoadRef = useRef({
     clusters: clusters.length,
@@ -278,15 +421,26 @@ export default function Incident() {
         const reportData = extractReport(stdout);
         setInvestigation({ stdout, report: reportData });
 
+        // The backend auto-saved this run to the persisted incident
+        // history; keep the full local copy too and re-sync so the id
+        // matches the server record.
         const entry = {
-          id: Date.now(),
+          id: data.incident_id || `local-${Date.now()}`,
           pod: podName,
           namespace,
+          target_type: "pod",
+          target_label: `${namespace}/${podName}`,
+          cluster: cluster || null,
           timestamp: new Date().toISOString(),
           report: reportData,
           stdout,
+          _local: true,
         };
-        setInvestigationHistory((prev) => [entry, ...prev]);
+        setInvestigationHistory((prev) => {
+          const prevList = Array.isArray(prev) ? prev : [];
+          return [entry, ...prevList.filter((e) => String(e.id) !== String(entry.id))];
+        });
+        loadHistory();
       }
     } catch (err) {
       console.error("Investigation failed:", err);
@@ -332,6 +486,10 @@ export default function Incident() {
   const signalCounts = logAnalysis?.signal_counts || {};
   const structuredEvents = evidence?.kubernetes?.events_structured || [];
   const timeline = evidence?.kubernetes?.timeline || [];
+  const logsTail = evidence?.kubernetes?.logs_tail || "";
+  const logsPrevious = evidence?.kubernetes?.logs_previous || "";
+  const logsPreviousAvailable = !!evidence?.kubernetes?.logs_previous_available;
+  const logsError = evidence?.kubernetes?.logs_error || null;
 
   const reportObj = investigationMatches ? investigation.report : null;
   const validityScore =
@@ -918,6 +1076,47 @@ export default function Incident() {
                   )}
                 </div>
 
+                <div className="report-section">
+                  <div className="report-section__title">
+                    Recent log tail
+                  </div>
+                  {logsError && !logsTail && (
+                    <p className="text-muted">{logsError}</p>
+                  )}
+                  {!logsTail && !logsError ? (
+                    <p className="text-muted">
+                      No log output collected from this pod (the container may
+                      exit without logging anything).
+                    </p>
+                  ) : logsTail ? (
+                    <details className="raw-output" open>
+                      <summary style={{ cursor: "pointer" }}>
+                        Current container logs ({logsTail.split("\n").filter(Boolean).length} lines
+                        {logsPreviousAvailable ? " · previous included" : ""})
+                      </summary>
+                      <pre
+                        className="code-block"
+                        style={{ maxHeight: 320, overflow: "auto" }}
+                      >
+                        {logsTail}
+                      </pre>
+                    </details>
+                  ) : null}
+                  {logsPrevious && (
+                    <details className="raw-output" style={{ marginTop: "var(--space-2)" }}>
+                      <summary style={{ cursor: "pointer" }}>
+                        Previous container logs (before last restart)
+                      </summary>
+                      <pre
+                        className="code-block"
+                        style={{ maxHeight: 320, overflow: "auto" }}
+                      >
+                        {logsPrevious}
+                      </pre>
+                    </details>
+                  )}
+                </div>
+
                 {timeline.length > 0 && (
                   <div className="report-section">
                     <div className="report-section__title">Timeline</div>
@@ -1187,15 +1386,19 @@ export default function Incident() {
             )}
           </Card>
 
-          {investigationHistory.length > 0 && (
+          {(investigationHistory.length > 0 || historyLoading) && (
             <Card
               title="Investigation history"
-              subtitle={`${investigationHistory.length} past investigation${investigationHistory.length === 1 ? "" : "s"} stored`}
+              subtitle={
+                historyLoading && investigationHistory.length === 0
+                  ? "Loading saved investigations…"
+                  : `${investigationHistory.length} past investigation${investigationHistory.length === 1 ? "" : "s"} stored (persisted server-side)`
+              }
               actions={
                 <button
                   type="button"
                   className="btn btn--ghost btn--sm"
-                  onClick={() => setInvestigationHistory([])}
+                  onClick={clearHistory}
                 >
                   Clear history
                 </button>
@@ -1209,6 +1412,11 @@ export default function Incident() {
                     ? Math.round(entry.report.validity_score * 100)
                     : null;
                   const ts = new Date(entry.timestamp);
+                  const label =
+                    entry.target_label ||
+                    (entry.namespace && entry.pod
+                      ? `${entry.namespace}/${entry.pod}`
+                      : entry.pod || entry.namespace || "Investigation");
                   return (
                     <div
                       key={entry.id}
@@ -1220,7 +1428,7 @@ export default function Incident() {
                     >
                       <button
                         type="button"
-                        onClick={() => setExpandedHistoryIdx(isExpanded ? null : idx)}
+                        onClick={() => toggleHistoryEntry(idx, investigationHistory)}
                         style={{
                           display: "flex",
                           alignItems: "center",
@@ -1238,7 +1446,10 @@ export default function Incident() {
                           {rootCause ? <CheckCircle2 size={12} /> : <AlertTriangle size={12} />}
                           {" "}{rootCause ? "Analyzed" : "Inconclusive"}
                         </Badge>
-                        <span style={{ fontWeight: 500 }}>{entry.namespace}/{entry.pod}</span>
+                        <span style={{ fontWeight: 500 }}>{label}</span>
+                        {entry.source === "chat" && (
+                          <Badge tone="info">Chat</Badge>
+                        )}
                         <span className="text-muted" style={{ marginLeft: "auto" }}>
                           {ts.toLocaleDateString()} {ts.toLocaleTimeString()}
                         </span>
@@ -1247,6 +1458,29 @@ export default function Incident() {
                             {validity}%
                           </Badge>
                         )}
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          title="Delete this entry"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteHistoryEntry(entry.id);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.stopPropagation();
+                              deleteHistoryEntry(entry.id);
+                            }
+                          }}
+                          style={{
+                            cursor: "pointer",
+                            color: "var(--muted)",
+                            display: "inline-flex",
+                            padding: 2,
+                          }}
+                        >
+                          ×
+                        </span>
                       </button>
                       {isExpanded && (
                         <div style={{
@@ -1254,6 +1488,11 @@ export default function Incident() {
                           borderTop: "1px solid var(--border)",
                           fontSize: 13,
                         }}>
+                          {entry.question && (
+                            <div style={{ marginBottom: "var(--space-2)" }} className="text-muted">
+                              <strong>Question:</strong> {entry.question}
+                            </div>
+                          )}
                           {rootCause && (
                             <div style={{ marginBottom: "var(--space-2)" }}>
                               <strong>Root cause:</strong> {rootCause}
