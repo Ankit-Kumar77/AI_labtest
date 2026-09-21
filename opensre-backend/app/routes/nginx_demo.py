@@ -274,7 +274,8 @@ def nginx_investigate(request: DemoRequest):
     state = _load_state()
     if state.get("failed") and state.get("synthetic_log"):
         # inject into nginx log_analysis
-        nginx_ev = evidence.get("nginx", {})
+        nginx_ev = evidence.get("nginx") or {}
+        evidence["nginx"] = nginx_ev
         synthetic = state["synthetic_log"]
         # ensure paths exist
         if "log_analysis" not in nginx_ev:
@@ -287,7 +288,7 @@ def nginx_investigate(request: DemoRequest):
             synthetic_access = '10.244.0.1 - - [11/Sep/2026:12:00:00 +0000] "GET /api/products HTTP/1.1" 500 0 "-" "curl"'
         nginx_ev["synthetic_failure"] = {"mode": mode, "synthetic_log": synthetic}
         # also push into per_pod logs if present
-        logs = nginx_ev.get("logs", {})
+        logs = nginx_ev.get("logs") or {}
         per_pod = logs.get("per_pod") or []
         if per_pod:
             per_pod[0]["logs_tail"] = (per_pod[0].get("logs_tail") or "") + "\n" + synthetic + "\n" + synthetic_access
@@ -298,10 +299,10 @@ def nginx_investigate(request: DemoRequest):
 
     # Recompute summary after synthetic injection (if any)
     try:
-        la = evidence.get("nginx", {}).get("log_analysis", {})
+        la = (evidence.get("nginx") or {}).get("log_analysis") or {}
         if la:
-            access = la.get("access", {})
-            error = la.get("error", {})
+            access = la.get("access") or {}
+            error = la.get("error") or {}
             counts = error.get("counts", {}) if isinstance(error, dict) else {}
             evidence["nginx"]["summary"] = {
                 "total_log_lines": access.get("total_lines", 0) + error.get("total_lines", 0),
@@ -321,7 +322,7 @@ def nginx_investigate(request: DemoRequest):
         pass
 
     # Add question framing for OpenSRE
-    summ = evidence.get("nginx", {}).get("summary", {}) or {}
+    summ = (evidence.get("nginx") or {}).get("summary", {}) or {}
     evidence["question"] = (
         f"Nginx failure demo mode={mode}. "
         f"Nginx evidence: 5xx={summ.get('http_5xx', '?')}, "
@@ -378,7 +379,7 @@ def nginx_status(context: str | None = Query(default=None)):
     evidence = None
     try:
         ev_res = investigation.collect_nginx_evidence(context=context)
-        evidence = ev_res.get("evidence", {}).get("nginx", {}).get("summary") if ev_res.get("success") else None
+        evidence = ((ev_res.get("evidence") or {}).get("nginx") or {}).get("summary") if ev_res.get("success") else None
     except Exception:
         pass
     return {

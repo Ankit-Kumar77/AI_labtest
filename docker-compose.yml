@@ -1,38 +1,49 @@
 version: '3.8'
 
 services:
-  yugabyte:
-    image: yugabytedb/yugabyte:latest
-    container_name: yugabyte
+  # NOTE: YugabyteDB and Aerospike now run as Kubernetes StatefulSets in the
+  # `databases` namespace (infra/k8s/yugabytedb, infra/k8s/aerospike).
+  # Do NOT run them here — `docker start yugabyte/aerospike` is obsolete and
+  # will confuse the dashboard (backend reads K8s state, not docker).
+  # Local backend accesses K8s DBs via port-forwards (see guide for running).
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
     ports:
-      - "5433:5433"   # YSQL API (PostgreSQL compatible)
-      - "7000:7000"   # Master UI
-      - "9000:9000"   # TServer UI
-      - "9042:9042"   # YCQL API
-    command: ["bin/yugabyted", "start", "--daemon=false", "--listen=0.0.0.0"]
+      - "9200:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-h", "localhost", "-p", "5433", "-U", "yugabyte", "-d", "yugabyte"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 30
+      start_period: 60s
     networks:
       - opensre-network
 
-  aerospike:
-    image: aerospike/aerospike-server:latest
-    container_name: aerospike
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    container_name: kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
     ports:
-      - "3000:3000"
-    healthcheck:
-      test: ["CMD", "asinfo", "-v", "build"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
     networks:
       - opensre-network
 
 networks:
   opensre-network:
     driver: bridge
+
+volumes:
+  elasticsearch-data:
+    driver: local

@@ -1,0 +1,106 @@
+# OpenSRE Demo - Complete Setup Prompt for OpenCode
+
+## Use This Prompt with OpenCode
+
+Copy and paste this entire prompt into OpenCode when you first open the project:
+
+---
+
+"I have cloned the OpenSRE Demo repository at /home/subrata/Desktop/project/AI_labtest. This is a Kubernetes observability platform with React frontend, FastAPI backend, VictoriaMetrics, Grafana, Elasticsearch, Kibana, Fluent Bit, Aerospike, and YugabyteDB.
+
+Please help me set up and run this project EXACTLY as it's currently running. Here's what I need:
+
+## Current Working State (as of Sept 17, 2026)
+- Kind cluster 'opensre-demo' is RUNNING with control-plane + worker nodes
+- All Kubernetes pods in 'observability' namespace are RUNNING:
+  - victoriametrics, grafana, otel-collector, vmagent
+  - opensre-es-master-0 (Elasticsearch), opensre-kibana-kibana
+  - fluent-bit DaemonSet (2 pods)
+  - kube-state-metrics, node-exporter
+- Application pods in 'opensre' namespace: catalog-api, flaky-service, traffic-gen, nginx
+- Elasticsearch cluster 'opensre-es' is GREEN with 10,000+ log documents
+- Databases run as K8s StatefulSets in 'databases' namespace (NO docker start):
+  - databases/yugabytedb-0 1/1 Running, databases/aerospike-0 1/1 Running
+- Backend API runs on port 8001, Frontend on 5173
+
+## Required Port-Forwards (MUST RUN IN SEPARATE TERMINALS)
+These are CRITICAL - the UI will not work without them:
+
+1. Elasticsearch: `kubectl port-forward -n observability svc/es-external 9200:9200`
+2. Kibana: `kubectl port-forward -n observability svc/opensre-kibana-kibana 5601:5601`
+3. VictoriaMetrics: `kubectl port-forward -n observability svc/victoriametrics-victoria-metrics-single-server 8428:8428`
+4. OpenTelemetry: `kubectl port-forward -n observability svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318`
+5. YugabyteDB (REQUIRED for backend → K8s DB): `kubectl port-forward -n databases svc/yugabytedb 5433:5433`
+6. Aerospike (REQUIRED for backend → K8s DB): `kubectl port-forward -n databases svc/aerospike 3001:3000`
+7. Grafana (optional): `kubectl port-forward -n observability svc/grafana 3000:80`
+
+## Backend & Frontend
+- Backend: `cd opensre-backend && source .venv/bin/activate && uvicorn app.main:app --reload --port 8001 --host 0.0.0.0`
+- Frontend: `cd frontend && npm run dev`
+
+## Verification Commands
+Run these to confirm everything works:
+- `curl http://localhost:8001/api/health` → {"status":"UP","service":"OpenSRE Backend"}
+- `kubectl get pods -n databases` → yugabytedb-0 1/1 Running, aerospike-0 1/1 Running
+- `curl http://localhost:8001/api/yugabyte/health` → {"success":true,"status":"connected"}
+- `curl http://localhost:8001/api/aerospike/health` → {"success":true,"status":"connected"}
+- `curl http://localhost:8001/api/elasticsearch/health` → {"success":true,"available":true,"version":"8.5.1","cluster":"opensre-es"}
+- `curl http://localhost:8001/api/elasticsearch/facets?since_minutes=60` → returns namespaces ["opensre","observability"] and pods
+- `curl http://localhost:8428/-/healthy` → OK
+- `curl http://localhost:5601/api/status` → returns Kibana status
+- Open http://localhost:5173 → React dashboard loads
+- Open http://localhost:5173/chaos → Database Failure Injection shows K8s StatefulSets, NOT "local container"
+
+## What I Need You to Do
+1. Check current status of all components
+2. Start any missing port-forwards
+3. Restart backend if needed (it caches ES client)
+4. Start frontend if not running
+5. Verify the Logs tab shows namespaces/pods dropdowns populated (not empty)
+6. Verify Kibana opens at http://localhost:5601
+7. Update any documentation if needed
+
+## Files to Reference
+- `/home/subrata/Desktop/project/AI_labtest/guide for running` - detailed startup guide
+- `/home/subrata/Desktop/project/AI_labtest/README.md` - full documentation
+- `/home/subrata/Desktop/project/AI_labtest/docker-compose.yml` - local databases
+- `/home/subrata/Desktop/project/AI_labtest/observability/install.sh` - full stack installer
+- `/home/subrata/Desktop/project/AI_labtest/infra/kind/kind-config.yaml` - Kind cluster config
+
+Start by checking what's currently running and what needs to be started."
+
+---
+
+## Quick Reference - Minimal Commands to Run Now
+
+If you just need to get it running right now (assuming cluster exists):
+
+```bash
+# Terminal 1 - Elasticsearch (REQUIRED for Logs tab)
+kubectl port-forward -n observability svc/es-external 9200:9200
+
+# Terminal 2 - Kibana
+kubectl port-forward -n observability svc/opensre-kibana-kibana 5601:5601
+
+# Terminal 3 - VictoriaMetrics (REQUIRED for Metrics)
+kubectl port-forward -n observability svc/victoriametrics-victoria-metrics-single-server 8428:8428
+
+# Terminal 3b - YugabyteDB (REQUIRED for backend → K8s DB)
+kubectl port-forward -n databases svc/yugabytedb 5433:5433
+
+# Terminal 3c - Aerospike (REQUIRED for backend → K8s DB)
+kubectl port-forward -n databases svc/aerospike 3001:3000
+
+# Terminal 4 - Backend (restart after ES + DB port-forwards)
+pkill -f "uvicorn app.main:app"
+cd /home/subrata/Desktop/project/AI_labtest/opensre-backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8001 --host 0.0.0.0
+
+# Terminal 5 - Frontend
+cd /home/subrata/Desktop/project/AI_labtest/frontend
+npm run dev
+```
+
+Then open: http://localhost:5173/logs → namespaces and pods dropdowns should work
+Kibana: http://localhost:5601

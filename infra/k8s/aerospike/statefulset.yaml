@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: aerospike
+  namespace: databases
+  labels:
+    app: aerospike
+spec:
+  serviceName: aerospike-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aerospike
+  template:
+    metadata:
+      labels:
+        app: aerospike
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3003"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: aerospike
+          image: aerospike/aerospike-server:7.1.0.3
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+              name: service
+            - containerPort: 3001
+              name: fabric
+            - containerPort: 3002
+              name: mesh
+            - containerPort: 3003
+              name: info
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "1000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /opt/aerospike/data
+          readinessProbe:
+            exec:
+              command:
+                - asinfo
+                - -v
+                - "build"
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - asinfo
+                - -v
+                - "build"
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aerospike-config
+  namespace: databases
+data:
+  aerospike.conf: |
+    service {
+        user root
+        group root
+        paxos-single-replica-limit 1
+        pidfile /var/run/aerospike/asd.pid
+        service-threads 4
+        transaction-queues 4
+        transaction-threads-per-queue 4
+        proto-fd-max 15000
+    }
+    
+    network {
+        service {
+            address any
+            port 3000
+        }
+        
+        heartbeat {
+            mode mesh
+            address any
+            port 3002
+            interval 150
+            timeout 10
+        }
+        
+        fabric {
+            address any
+            port 3001
+        }
+        
+        info {
+            address any
+            port 3003
+        }
+    }
+    
+    namespace test {
+        replication-factor 1
+        memory-size 256M
+        default-ttl 30d
+        storage-engine device {
+            file /opt/aerospike/data/test.dat
+            filesize 1G
+            data-in-memory true
+        }
+    }

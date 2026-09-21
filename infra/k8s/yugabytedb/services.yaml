@@ -1,0 +1,49 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: yugabytedb
+  namespace: databases
+  labels:
+    app: yugabytedb
+spec:
+  type: ClusterIP
+  selector:
+    app: yugabytedb
+  ports:
+    - name: ysql
+      port: 5433
+      targetPort: 5433
+    - name: ycql
+      port: 9042
+      targetPort: 9042
+    - name: master-ui
+      port: 7000
+      targetPort: 7000
+    - name: tserver-ui
+      port: 9000
+      targetPort: 9000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: yugabytedb-headless
+  namespace: databases
+  labels:
+    app: yugabytedb
+spec:
+  clusterIP: None
+  selector:
+    app: yugabytedb
+  ports:
+    - name: ysql
+      port: 5433
+      targetPort: 5433
+    - name: ycql
+      port: 9042
+      targetPort: 9042
+    - name: master-ui
+      port: 7000
+      targetPort: 7000
+    - name: tserver-ui
+      port: 9000
+      targetPort: 9000

@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 
 from app.core.config import settings
+from app.services import portforward
 from app.utils.command import run_command
 
 router = APIRouter(
@@ -43,6 +44,12 @@ INJECT_ACTIONS = {
     "insert-duplicates-aerospike": "insert-duplicates-aerospike",
     "insert-invalid-yugabyte": "insert-invalid-yugabyte",
     "insert-invalid-aerospike": "insert-invalid-aerospike",
+    # Database failure injection (K8s-based)
+    "yugabyte-unavailable": "yugabyte-unavailable",
+    "yugabyte-latency": "yugabyte-latency",
+    "yugabyte-connection-pressure": "yugabyte-connection-pressure",
+    "aerospike-unavailable": "aerospike-unavailable",
+    "aerospike-latency": "aerospike-latency",
 }
 
 RECOVER_ACTIONS = {
@@ -56,6 +63,12 @@ RECOVER_ACTIONS = {
     "elk-recover": "elk-recover",
     "uncordon": "uncordon",
     "all": "all",
+    # Database failure recovery (K8s-based)
+    "yugabyte-unavailable-recover": "yugabyte-unavailable-recover",
+    "yugabyte-latency-recover": "yugabyte-latency-recover",
+    "yugabyte-connection-pressure-recover": "yugabyte-connection-pressure-recover",
+    "aerospike-unavailable-recover": "aerospike-unavailable-recover",
+    "aerospike-latency-recover": "aerospike-latency-recover",
 }
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -74,8 +87,8 @@ def _strip_ansi(text):
     return ANSI_RE.sub("", text or "")
 
 
-def _command(command):
-    result = run_command(command)
+def _command(command, timeout=180):
+    result = run_command(command, timeout=timeout)
     return {
         "success": result.get("success", False),
         "stdout": _strip_ansi(result.get("stdout", "")),
@@ -84,7 +97,43 @@ def _command(command):
     }
 
 
+def _k8s_db_state(name):
+    """Check Kubernetes StatefulSet pod state for databases (source of truth).
+
+    Maps chaos names to actual StatefulSet pods in the `databases` namespace:
+      yugabyte/yugabytedb -> yugabytedb-0, aerospike -> aerospike-0.
+    Returns running/stopped/missing so the dashboard reflects K8s, not docker.
+    """
+    pod_map = {
+        "yugabyte": "yugabytedb-0",
+        "yugabytedb": "yugabytedb-0",
+        "aerospike": "aerospike-0",
+    }
+    pod = pod_map.get(name)
+    if not pod:
+        return None
+    result = _command(
+        ["kubectl", "get", "pod", pod, "-n", "databases",
+         "-o", "jsonpath={.status.phase}:{.status.containerStatuses[0].ready}"]
+    )
+    if not result.get("success"):
+        return "stopped"
+    out = (result.get("stdout") or "").strip()
+    # e.g. "Running:true" -> running, anything else -> stopped
+    if out == "Running:true":
+        return "running"
+    if "Running" in out:
+        return "stopped"
+    if not out:
+        return "stopped"
+    return "stopped"
+
+
 def _container_state(name):
+    # Databases now run as K8s StatefulSets — check K8s first.
+    if name in ("yugabyte", "yugabytedb", "aerospike"):
+        return _k8s_db_state(name)
+
     docker = _command(
         ["docker", "ps", "-a", "--filter", f"name={name}", "--format", "{{.Status}}"]
     )
@@ -218,7 +267,36 @@ def inject(request: ActionRequest):
 
         base_url = f"http://127.0.0.1:8001"
         try:
-            with httpx.Client(timeout=30.0) as client:
+            # Recover can block on StatefulSet rollout (up to ~4 min) —
+            # keep the client timeout above the rollout wait.
+            with httpx.Client(timeout=300.0) as client:
+                resp = client.post(f"{base_url}{endpoint}", json={"target": target})
+                if resp.status_code == 200:
+                    return {"success": True, "action": action, "stdout": resp.text}
+                else:
+                    return {"success": False, "action": action, "error": resp.text}
+        except Exception as e:
+            return {"success": False, "action": action, "error": str(e)}
+
+    # Database failure injection (K8s-based) - call demo API endpoints
+    if action in {
+        "yugabyte-unavailable", "yugabyte-latency", "yugabyte-connection-pressure",
+        "aerospike-unavailable", "aerospike-latency"
+    }:
+        target = "yugabyte" if "yugabyte" in action else "aerospike"
+        
+        if "unavailable" in action:
+            endpoint = f"/api/demo/db-scenario/unavailable/fail"
+        elif "latency" in action:
+            endpoint = f"/api/demo/db-scenario/latency/induce"
+        elif "connection-pressure" in action:
+            endpoint = f"/api/demo/db-scenario/connection-pressure/induce"
+        else:
+            endpoint = f"/api/demo/db-scenario/unavailable/fail"
+
+        base_url = f"http://127.0.0.1:8001"
+        try:
+            with httpx.Client(timeout=60.0) as client:
                 resp = client.post(f"{base_url}{endpoint}", json={"target": target})
                 if resp.status_code == 200:
                     return {"success": True, "action": action, "stdout": resp.text}
@@ -247,14 +325,69 @@ def recover(request: ActionRequest):
             "error": f"Unknown recovery '{request.action}'. Available: {list(RECOVER_ACTIONS.keys())}",
         }
 
-    result = _command(["bash", str(RUNBOOK), "recover", action])
+    # Database failure recovery (K8s-based) - call demo API endpoints
+    if action in {
+        "yugabyte-unavailable-recover", "yugabyte-latency-recover", 
+        "yugabyte-connection-pressure-recover",
+        "aerospike-unavailable-recover", "aerospike-latency-recover"
+    }:
+        target = "yugabyte" if "yugabyte" in action else "aerospike"
+        
+        if "unavailable-recover" in action:
+            endpoint = f"/api/demo/db-scenario/unavailable/recover"
+        elif "latency-recover" in action:
+            endpoint = f"/api/demo/db-scenario/latency/recover"
+        elif "connection-pressure-recover" in action:
+            endpoint = f"/api/demo/db-scenario/connection-pressure/recover"
+        else:
+            endpoint = f"/api/demo/db-scenario/unavailable/recover"
+
+        base_url = f"http://127.0.0.1:8001"
+        try:
+            with httpx.Client(timeout=60.0) as client:
+                resp = client.post(f"{base_url}{endpoint}", json={"target": target})
+                if resp.status_code == 200:
+                    return {"success": True, "action": action, "stdout": resp.text}
+                else:
+                    return {"success": False, "action": action, "error": resp.text}
+        except Exception as e:
+            return {"success": False, "action": action, "error": str(e)}
+
+    result = _command(["bash", str(RUNBOOK), "recover", action], timeout=200)
     if not result.get("success"):
         return _action_failed(action, result)
+
+    pf = None
+    pf_note = None
+    if action in ("aerospike-up", "yugabyte-up"):
+        # The port-forward dies on scale-to-0 — restart it so the DB page
+        # flips back to connected without manual terminal steps.
+        target = "aerospike" if action.startswith("aerospike") else "yugabyte"
+        pf = portforward.ensure(target)
+        pf_note = (
+            f"Port-forward: {pf.get('detail')} "
+            f"(`{pf.get('command')}`)"
+        )
+
+    stdout = result.get("stdout", "")
+    if pf_note:
+        stdout = (stdout + "\n\n" + pf_note).strip()
 
     return {
         "success": True,
         "action": action,
-        "stdout": result.get("stdout", ""),
+        "stdout": stdout,
+        "port_forward": pf,
+        "port_forward_hint": (
+            "Database recoveries scale a StatefulSet back up — the kubectl "
+            "port-forward for that DB dies when it scales to 0. If the DB "
+            "page still shows Unreachable after a successful rollout, "
+            "restart the forward (yugabyte: `kubectl port-forward -n "
+            "databases svc/yugabytedb 5433:5433`, aerospike: `kubectl "
+            "port-forward -n databases svc/aerospike 3001:3000`) and "
+            "re-check health."
+            if action in ("aerospike-up", "yugabyte-up") else None
+        ),
     }
 
 

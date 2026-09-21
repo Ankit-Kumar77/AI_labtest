@@ -23,6 +23,8 @@ export const dbInvestigationApi = {
   yugabyteEvidence: (params = {}) => api.get("/db-investigation/yugabyte/evidence", { params }),
   yugabyteQuery: (sql, options = {}) => api.post("/db-investigation/yugabyte/query", { sql, ...options }),
   opensreInvestigateYugabyte: () => api.get("/db-investigation/opensre/investigate/yugabyte"),
+  yugabyteLogs: (params = {}) => api.get("/db-investigation/yugabyte/logs", { params }),
+  yugabyteLogHistory: (params = {}) => api.get("/db-investigation/yugabyte/log-history", { params }),
 
   // Aerospike
   aerospikeHealth: () => api.get("/db-investigation/aerospike/health"),
@@ -31,6 +33,8 @@ export const dbInvestigationApi = {
   aerospikeDataIntegrity: (data) => api.post("/db-investigation/aerospike/data-integrity", data),
   aerospikeNamespaceStats: (namespace, set) => api.post("/db-investigation/aerospike/namespace-stats", null, { params: { namespace, set_name: set } }),
   opensreInvestigateAerospike: () => api.get("/db-investigation/opensre/investigate/aerospike"),
+  aerospikeLogs: (params = {}) => api.get("/db-investigation/aerospike/logs", { params }),
+  aerospikeLogHistory: (params = {}) => api.get("/db-investigation/aerospike/log-history", { params }),
 
   // All databases
   allDatabaseEvidence: () => api.get("/db-investigation/evidence"),
@@ -92,6 +96,15 @@ export const elkDemoApi = {
   fail: (mode) => api.post("/demo/elk/fail", { mode }),
   investigate: (mode) => api.post("/demo/elk/investigate", { mode }),
   recover: (mode) => api.post("/demo/elk/recover", { mode }),
+};
+
+// Persisted investigation / incident history (auto-saved server-side on
+// every OpenSRE investigation, readable later from the Incident page)
+export const incidentsApi = {
+  list: (limit = 100) => api.get("/incidents", { params: { limit } }),
+  get: (id) => api.get(`/incidents/${encodeURIComponent(id)}`),
+  remove: (id) => api.delete(`/incidents/${encodeURIComponent(id)}`),
+  clear: () => api.delete("/incidents"),
 };
 
 export default api;

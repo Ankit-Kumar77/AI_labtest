@@ -1,13 +1,13 @@
 import subprocess
 
 
-def run_command(command):
+def run_command(command, timeout=180):
     try:
         result = subprocess.run(
             command,
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=timeout,
         )
 
         return {

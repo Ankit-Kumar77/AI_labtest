@@ -1,73 +1,179 @@
 OPEN SRE DEMO STARTUP
 
-1. Start Kubernetes
+=========================================================
+PREREQUISITES
+=========================================================
+- Ubuntu 24.04/26.04 LTS
+- Python 3.13+
+- Node.js 24+
+- Git
+- Podman
+- Kind
+- kubectl
+- Helm
+- OpenSRE CLI
 
-sudo podman start opensre-demo-control-plane opensre-demo-worker
+Verify:
+  python3 --version
+  node -v
+  npm -v
+  podman --version
+  kubectl version --client
+  kind version
+  helm version
+  opensre --version
 
-kubectl get nodes
-kubectl get pods -A
+=========================================================
+FIRST TIME SETUP (run once)
+=========================================================
 
+1. Create Kubernetes Cluster
+  sudo kind create cluster \
+    --name opensre-demo \
+    --config infra/kind/kind-config.yaml
 
-2. Grafana
+  Verify: kubectl get nodes
 
-Grafana is exposed as a NodePort (30300) and mapped to localhost:3000 via
-infra/kind/kind-config.yaml (extraPortMappings). If the cluster was created
-with that file, open http://localhost:3000 directly (no port-forward needed).
+2. Build & Load catalog-api Image
+  cd catalog-api
+  sudo podman build -t localhost/catalog-api:v1 .
+  sudo podman save localhost/catalog-api:v1 -o catalog-api.tar
+  sudo kind load image-archive catalog-api.tar --name opensre-demo
+  rm catalog-api.tar
+  cd ..
 
-If you have an older cluster without the port mapping, use:
+3. Deploy Application + Databases (all in Kind, NO docker start)
+  kubectl apply -f infra/k8s/namespace.yaml
+  kubectl apply -f infra/k8s/catalog-api-deployment.yaml
+  kubectl apply -f infra/k8s/catalog-api-service.yaml
+  kubectl apply -f infra/k8s/nginx-configmap.yaml
+  kubectl apply -f infra/k8s/nginx-deployment.yaml
+  kubectl apply -f infra/k8s/nginx-service.yaml
+  kubectl apply -f infra/k8s/yugabytedb/
+  kubectl apply -f infra/k8s/aerospike/
+  # NOTE: YugabyteDB + Aerospike run as StatefulSets in namespace/databases.
+  # Do NOT use `docker start yugabyte/aerospike` — those containers are deleted.
+  # Dashboard reads K8s state (databases/yugabytedb-0, databases/aerospike-0).
 
-kubectl port-forward -n observability svc/grafana 3000:80
+4. Deploy Observability Stack (metrics + logs)
+  ./observability/install.sh
+  # This installs: VictoriaMetrics, Grafana, OpenTelemetry, vmagent,
+  # Elasticsearch, Kibana, Fluent Bit
 
-Open: http://localhost:3000
+  # Verify databases are running:
+  kubectl get pods -n databases
+  # Should show: yugabytedb-0 1/1 Running, aerospike-0 1/1 Running
+  # (YugabyteDB takes ~2-3 min on first start)
 
-NOTE: the "OpenSRE Cluster & Pod Overview" dashboard is provisioned via
-observability/grafana-values.yaml. After changing that file, reload it:
+=========================================================
+DAILY STARTUP (run every time)
+=========================================================
 
-helm upgrade grafana grafana/grafana \
-  -n observability \
-  -f observability/grafana-values.yaml
+TERMINAL 1 - Elasticsearch Port-Forward (REQUIRED for Logs)
+  kubectl port-forward -n observability svc/es-external 9200:9200
 
+TERMINAL 2 - Kibana Port-Forward (REQUIRED for Kibana UI)
+  kubectl port-forward -n observability svc/opensre-kibana-kibana 5601:5601
 
-3. VictoriaMetrics
+TERMINAL 3 - VictoriaMetrics Port-Forward (REQUIRED for Metrics)
+  kubectl port-forward -n observability svc/victoriametrics-victoria-metrics-single-server 8428:8428
 
-kubectl port-forward -n observability svc/victoriametrics-victoria-metrics-single-server 8428:8428
+TERMINAL 4 - OpenTelemetry Port-Forward (REQUIRED for Traces)
+  kubectl port-forward -n observability svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318
 
-Check:
-curl http://localhost:8428/-/healthy
+TERMINAL 4b - YugabyteDB Port-Forward (REQUIRED for backend → K8s DB)
+  kubectl port-forward -n databases svc/yugabytedb 5433:5433
 
+TERMINAL 4c - Aerospike Port-Forward (REQUIRED for backend → K8s DB)
+  kubectl port-forward -n databases svc/aerospike 3001:3000
+  # Host 3000 is taken by Grafana Kind mapping, so Aerospike uses 3001.
+  # .env must have AEROSPIKE_HOSTS=127.0.0.1:3001 (already set).
 
-4. OpenTelemetry
+TERMINAL 5 - Backend API
+  cd opensre-backend
+  source .venv/bin/activate
+  uvicorn app.main:app --reload --port 8001 --host 0.0.0.0
 
-kubectl port-forward -n observability svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318
+TERMINAL 6 - Frontend
+  cd frontend
+  npm run dev
 
+TERMINAL 7 - Grafana (optional, if not using Kind port 3000)
+  kubectl port-forward -n observability svc/grafana 3000:80
 
-5. Backend
+=========================================================
+ACCESS URLS
+=========================================================
+Frontend (Dashboard)     : http://localhost:5173
+Backend API              : http://localhost:8001
+Backend Swagger          : http://localhost:8001/docs
+Grafana                  : http://localhost:3000 (via Kind) or http://localhost:3000 (port-forward)
+Elasticsearch            : http://localhost:9200 (port-forward)
+Kibana                   : http://localhost:5601 (port-forward)
+VictoriaMetrics          : http://localhost:8428 (port-forward)
+YugabyteDB (K8s)         : localhost:5433 via port-forward (svc/yugabytedb 5433:5433)
+  # In-cluster DNS: yugabytedb.databases.svc.cluster.local:5433
+Aerospike (K8s)          : localhost:3001 via port-forward (svc/aerospike 3001:3000)
+  # In-cluster DNS: aerospike.databases.svc.cluster.local:3000
+  # .env uses 127.0.0.1:5433 + 127.0.0.1:3001 to reach K8s via port-forwards.
 
-cd ~/Projects/opensre-demo/opensre-backend
-source .venv/bin/activate
-uvicorn app.main:app --reload --port 8001
+=========================================================
+VERIFICATION
+=========================================================
+Backend health:        curl http://localhost:8001/api/health
+YugabyteDB (K8s):      curl http://localhost:8001/api/yugabyte/health
+Aerospike (K8s):       curl http://localhost:8001/api/aerospike/health
+Elasticsearch health:  curl http://localhost:8001/api/elasticsearch/health
+ES Facets:             curl http://localhost:8001/api/elasticsearch/facets?since_minutes=60
+VictoriaMetrics:       curl http://localhost:8428/-/healthy
+Grafana:               curl http://localhost:3000/api/health
+Kibana:                curl http://localhost:5601/api/status
+Frontend:              open http://localhost:5173
+Kubernetes DBs:        kubectl get pods -n databases
+Kubernetes all:        kubectl get pods -A
 
+=========================================================
+DATABASE FAILURE INJECTION DEMO (NEW!)
+=========================================================
 
-6. Frontend
+1. Open Chaos page: http://localhost:5173/chaos
+2. Scroll to "Database Failure Injection" section
+3. Click "Inject" on a scenario (e.g., "YugabyteDB Unavailable")
+4. Go to YugabyteDB page: http://localhost:5173/yugabyte
+   → Health shows "Unreachable"
+5. Click "Investigate with OpenSRE" button
+6. OpenSRE collects evidence from:
+   - YugabyteDB (health, connections, slow queries, errors)
+   - Kubernetes (pod state, events, logs)
+   - VictoriaMetrics (metrics, latency)
+   - Elasticsearch (ERROR/EXCEPTION/TIMEOUT logs)
+7. View RCA with Root Cause, Evidence, Impact, Timeline, Recommendation, Confidence
+8. Click "Recover" to restore database
 
-cd ~/Projects/opensre-demo/frontend
-npm run dev
+Available Scenarios:
+  YugabyteDB: Unavailable, High Latency, Connection Pressure
+  Aerospike:  Unavailable, High Latency
 
-Open: http://localhost:5173
-
-
-7. Aerospike & Yugabyte
-
-docker start aerospike
-docker start yugabyte
-
-
-DEMO FLOW
-
-Frontend → Metrics page → pick Instance / Node / Pod
-→ embedded Grafana dashboard re-filters live
-
-Frontend → Kubernetes page → Investigate pod → OpenSRE + Gemini → RCA
-Grafana → Show metrics/observability
-VictoriaMetrics → Metrics backend
-OpenTelemetry → Telemetry collector
+=========================================================
+TROUBLESHOOTING
+=========================================================
+- If Elasticsearch unavailable in Logs tab: ensure TERMINAL 1 port-forward is running
+- If Kibana won't open: ensure TERMINAL 2 port-forward is running
+- If no metrics: ensure TERMINAL 3 port-forward is running
+- If backend can't connect to ES: restart backend AFTER starting port-forward
+- If YugabyteDB/Aerospike show "Unreachable" but you didn't inject:
+  check kubectl get pods -n databases (both should be 1/1 Running).
+  check TERMINAL 4b/4c port-forwards are running.
+- After a Database Unavailable inject → recover cycle, RESTART that database's
+  port-forward (TERMINAL 4b/4c): kubectl port-forward dies together with the
+  pod when the StatefulSet scales to 0, so the backend can't reconnect until
+  you restart it. Then re-check /api/yugabyte/health or /api/aerospike/health.
+  Do NOT run `docker start yugabyte/aerospike` — those containers are deleted.
+  DBs live in K8s; dashboard reads K8s state, not docker.
+- If YugabyteDB pod is 0/1 Running after restart: wait 2-3 min (first start is slow),
+  then kubectl exec -n databases yugabytedb-0 -- bin/yugabyted status
+- If Kind cluster recreated with sudo: refresh kubeconfig
+    mkdir -p ~/.kube
+    sudo cp /root/.kube/config ~/.kube/config
+    sudo chown $USER:$USER ~/.kube/config
+    chmod 600 ~/.kube/config

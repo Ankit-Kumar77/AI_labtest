@@ -68,6 +68,14 @@ export default function Settings() {
           return "Connected";
         },
       },
+      github: {
+        label: "GitHub Integration",
+        endpoint: "api.github.com",
+        check: async () => {
+          const res = await api.get("/github/health");
+          return res.data.success ? "Connected" : "Unreachable";
+        },
+      },
       opensre: {
         label: "OpenSRE CLI",
         endpoint: "AI investigation engine",

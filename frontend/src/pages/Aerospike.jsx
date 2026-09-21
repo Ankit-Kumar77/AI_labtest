@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import api from "../api/api";
+import api, { dbInvestigationApi } from "../api/api";
 import Card from "../components/Card";
 import Badge from "../components/Badge";
+import DbLogs from "../components/DbLogs";
 import {
   Database,
   CheckCircle2,
@@ -36,21 +37,51 @@ export default function Aerospike() {
   const [demoInvestigation, setDemoInvestigation] = useState(null);
   const [demoRecovery, setDemoRecovery] = useState(null);
   const [demoError, setDemoError] = useState(null);
+  const [healthHint, setHealthHint] = useState(null);
+  const [healthPf, setHealthPf] = useState(null);
+
+  const loadHealth = async () => {
+    setChecking(true);
+    try {
+      const res = await api.get("/aerospike/health");
+      setStatus(res.data.success ? "connected" : "unreachable");
+      setHealthHint(!res.data.success ? res.data.hint || res.data.error || null : null);
+      setHealthPf(!res.data.success ? res.data.port_forward || null : null);
+    } catch {
+      setStatus("backend-offline");
+      setHealthHint(null);
+      setHealthPf(null);
+    } finally {
+      setChecking(false);
+    }
+  };
 
   useEffect(() => {
-    async function load() {
-      setChecking(true);
+    loadHealth();
+  }, []);
+
+  // After a recover, rollout + port-forward restart can take a while —
+  // keep polling until the backend reports connected (or give up with
+  // the latest hint so the user knows exactly what to run).
+  const pollHealthUntilConnected = async (tries = 40) => {
+    for (let i = 0; i < tries; i++) {
       try {
         const res = await api.get("/aerospike/health");
-        setStatus(res.data.success ? "connected" : "unreachable");
+        if (res.data.success) {
+          setStatus("connected");
+          setHealthHint(null);
+          setHealthPf(null);
+          return;
+        }
+        setStatus("unreachable");
+        setHealthHint(res.data.hint || res.data.error || null);
+        setHealthPf(res.data.port_forward || null);
       } catch {
         setStatus("backend-offline");
-      } finally {
-        setChecking(false);
       }
+      await new Promise((r) => setTimeout(r, 3000));
     }
-    load();
-  }, []);
+  };
 
   const loadRecords = async () => {
     setLoadingRecords(true);
@@ -160,7 +191,12 @@ export default function Aerospike() {
         setDemoPhase("investigated");
         setDemoInvestigation(res.data.opensre);
       } else {
-        setDemoError(res.data.error || "Investigation failed");
+        setDemoError(
+          res.data.opensre?.error ||
+            res.data.opensre?.hint ||
+            res.data.error ||
+            "Investigation failed"
+        );
       }
     } catch (e) {
       setDemoError(e.message);
@@ -177,9 +213,15 @@ export default function Aerospike() {
       if (res.data.success) {
         setDemoPhase("recovered");
         setDemoRecovery(res.data.recovery);
-        setTimeout(() => setStatus("connected"), 2000);
+        // Backend restarts the port-forward during recover — poll until
+        // health actually flips to connected.
+        pollHealthUntilConnected();
       } else {
-        setDemoError(res.data.error || "Recovery failed");
+        setDemoError(
+          res.data.recovery?.port_forward_hint ||
+            res.data.error ||
+            "Recovery failed"
+        );
       }
     } catch (e) {
       setDemoError(e.message);
@@ -233,6 +275,14 @@ export default function Aerospike() {
               <div className="text-muted" style={{ fontSize: 13 }}>
                 Aerospike server: localhost:3001
               </div>
+              {healthHint && (
+                <div className="alert alert--danger" style={{ marginTop: "var(--space-2)", fontSize: 12 }}>
+                  {healthHint}
+                  {healthPf && (
+                    <pre style={{ marginTop: 6, fontSize: 11, whiteSpace: "pre-wrap" }}>{healthPf}</pre>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         </Card>
@@ -432,6 +482,13 @@ export default function Aerospike() {
           </div>
         )}
       </Card>
+
+      <DbLogs
+        target="aerospike"
+        podHint="databases/aerospike-0"
+        fetchLive={(params) => dbInvestigationApi.aerospikeLogs(params)}
+        fetchHistory={(params) => dbInvestigationApi.aerospikeLogHistory(params)}
+      />
     </>
   );
 }

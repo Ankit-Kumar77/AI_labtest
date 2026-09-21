@@ -188,7 +188,7 @@ def coredns_status(context: str | None = Query(default=None)):
     try:
         ev_res = investigation.collect_coredns_evidence(context=context)
         if ev_res.get("success"):
-            summary = ev_res.get("evidence", {}).get("coredns", {}).get(
+            summary = ((ev_res.get("evidence") or {}).get("coredns") or {}).get(
                 "summary")
     except Exception:
         pass
@@ -256,7 +256,8 @@ def coredns_investigate(request: DemoRequest):
     state = _load_state()
     if state.get("failed") and state.get("synthetic_log"):
         synthetic = state["synthetic_log"]
-        coredns_ev = evidence.setdefault("coredns", {})
+        coredns_ev = evidence.get("coredns") or {}
+        evidence["coredns"] = coredns_ev
         coredns_ev["synthetic_failure"] = {
             "mode": mode, "synthetic_log": synthetic
         }
@@ -279,11 +280,11 @@ def coredns_investigate(request: DemoRequest):
                 }
             coredns_ev["summary"] = {
                 "health_status": ("down" if mode == "down" else "degraded"),
-                "probe_verdict": coredns_ev["probe"].get("verdict"),
-                "probe_latency_ms_avg": coredns_ev["probe"].get(
+                "probe_verdict": (coredns_ev.get("probe") or {}).get("verdict"),
+                "probe_latency_ms_avg": (coredns_ev.get("probe") or {}).get(
                     "latency_ms_avg"),
-                "probe_succeeded": coredns_ev["probe"].get("succeeded"),
-                "probe_attempts": coredns_ev["probe"].get("attempts"),
+                "probe_succeeded": (coredns_ev.get("probe") or {}).get("succeeded"),
+                "probe_attempts": (coredns_ev.get("probe") or {}).get("attempts"),
                 "servfail": analysis.get("counts", {}).get("servfail", 0),
                 "dns_timeouts": analysis.get("counts", {}).get("timeout", 0),
                 "dns_refused": 0,
@@ -295,7 +296,7 @@ def coredns_investigate(request: DemoRequest):
         except Exception:
             pass
 
-    summ = evidence.get("coredns", {}).get("summary", {}) or {}
+    summ = (evidence.get("coredns") or {}).get("summary", {}) or {}
     evidence["question"] = (
         f"CoreDNS failure demo mode={mode}. "
         f"CoreDNS evidence: health={summ.get('health_status', '?')}, "

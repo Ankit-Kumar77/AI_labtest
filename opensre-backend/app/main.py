@@ -18,6 +18,7 @@ from app.routes.coredns import router as coredns_router
 from app.routes.coredns_demo import router as coredns_demo_router
 from app.routes.elasticsearch import router as elasticsearch_router
 from app.routes.elk_demo import router as elk_demo_router
+from app.routes.incidents import router as incidents_router
 
 app = FastAPI(
     title="OpenSRE Backend",
@@ -50,6 +51,7 @@ app.include_router(coredns_router)
 app.include_router(coredns_demo_router)
 app.include_router(elasticsearch_router)
 app.include_router(elk_demo_router)
+app.include_router(incidents_router)
 
 
 @app.get("/")

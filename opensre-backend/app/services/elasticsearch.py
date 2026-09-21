@@ -370,6 +370,10 @@ def elk_health() -> dict:
     return elk_connector.health()
 
 
+def error_summary(**kwargs) -> dict:
+    return elk_connector.error_summary(**kwargs)
+
+
 # NEW: Facets endpoint
 def get_facets(**kwargs) -> dict:
     return elk_connector.get_facets(**kwargs)

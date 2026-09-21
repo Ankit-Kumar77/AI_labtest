@@ -190,7 +190,7 @@ def elk_investigate(request: DemoRequest):
             pass
         evidence["summary"] = es_ev.get("summary", {})
 
-    summ = evidence.get("elasticsearch", {}).get("summary", {}) or {}
+    summ = (evidence.get("elasticsearch") or {}).get("summary", {}) or {}
     evidence["question"] = (
         f"ELK failure demo mode={mode}. "
         f"ELK error summary: {summ}. "

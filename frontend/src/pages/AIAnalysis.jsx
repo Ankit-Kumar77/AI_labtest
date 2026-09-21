@@ -199,6 +199,7 @@ export default function AIAnalysis() {
     "opensre:investigationTarget",
     ""
   );
+  const [savedIncidentId, setSavedIncidentId] = useState(null);
   const [gitCorrelation, setGitCorrelation] = useState(null);
   const [loading, setLoading] = useState(false);
 
@@ -384,6 +385,7 @@ export default function AIAnalysis() {
 
     setLoading(true);
     setInvestigation(null);
+    setSavedIncidentId(null);
     setVmMetrics(null);
     setEsSignals(null);
 
@@ -419,6 +421,9 @@ export default function AIAnalysis() {
       } else {
         const stdout = stripAnsi(data.stdout || "");
         setInvestigation({ stdout, report: extractReport(stdout) });
+        // The backend auto-saved this run to the persisted incident
+        // history — keep the id so the user can jump straight to it.
+        if (data.incident_id) setSavedIncidentId(data.incident_id);
 
         // Capture VictoriaMetrics pod metrics and ES log signals
         if (data.vm_metrics) setVmMetrics(data.vm_metrics);
@@ -746,9 +751,17 @@ export default function AIAnalysis() {
           subtitle={`Target · ${investigationTarget}`}
           actions={
             <>
-              <Link to="/incident" className="btn btn--ghost btn--sm">
+              <Link
+                to={savedIncidentId ? `/incident?report=${savedIncidentId}` : "/incident"}
+                className="btn btn--ghost btn--sm"
+              >
                 <FileText size={13} /> Open incident report
               </Link>
+              {savedIncidentId && (
+                <Badge tone="success">
+                  <CheckCircle2 size={12} /> Saved to history
+                </Badge>
+              )}
               <Badge tone={report ? "success" : "warning"}>
                 {report ? (
                   <>
