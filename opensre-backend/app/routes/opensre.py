@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     cluster: str | None = None
     namespace: str | None = None
     pod: str | None = None
+    node: str | None = None
     target_type: str | None = None
 
 
@@ -114,8 +115,17 @@ def investigate_pod(
     if not evidence_result.get("success"):
         return evidence_result
 
+    # The CLI reads input as an alert payload and has no live k8s tools in
+    # this environment, so fold the evidence digest into the description to
+    # ground the RCA (bare evidence produces "Unable to determine root cause").
+    payload = investigation.pod_alert_payload(
+        evidence_result["evidence"],
+        namespace,
+        pod_name,
+    )
+
     # Run investigation via CLI to get the markdown report
-    cli_result = opensre_cli.investigate(evidence_result["evidence"])
+    cli_result = opensre_cli.investigate(payload, source="pod-investigation")
 
     # Enrich the response with VictoriaMetrics pod metrics and ES log signals
     enriched = {
@@ -128,6 +138,42 @@ def investigate_pod(
         "vm_metrics": ((evidence_result.get("evidence") or {}).get("metrics") or {}).get("pod", {}),
         # Elasticsearch log signals (ERROR/EXCEPTION/TIMEOUT counts + sample logs)
         "es_signals": (evidence_result.get("evidence") or {}).get("elasticsearch", {}) or {},
+    }
+    return enriched
+
+
+@router.get("/investigate/node/{node_name}")
+def investigate_node(
+    node_name: str,
+    context: str | None = None,
+    tail: int = 200,
+):
+    evidence_result = investigation.collect_node_evidence(
+        node_name,
+        context,
+        tail=max(10, min(tail, 500)),
+    )
+
+    if not evidence_result.get("success"):
+        return evidence_result
+
+    # Run investigation via CLI to get the markdown report
+    cli_result = opensre_cli.investigate(
+        evidence_result["evidence"],
+        source="node-investigation",
+    )
+
+    evidence = evidence_result.get("evidence") or {}
+    enriched = {
+        "success": cli_result.get("success"),
+        "stdout": cli_result.get("stdout"),
+        "stderr": cli_result.get("stderr"),
+        "returncode": cli_result.get("returncode"),
+        "incident_id": cli_result.get("incident_id"),
+        # VictoriaMetrics node metrics (node-exporter + kube-state-metrics)
+        "vm_metrics": (evidence.get("metrics") or {}).get("node", {}),
+        # Elasticsearch log signals for pods on the node
+        "es_signals": (evidence.get("elasticsearch") or {}) or {},
     }
     return enriched
 
@@ -219,6 +265,16 @@ def chat(request: ChatRequest):
             )
         elif request.target_type == "elk":
             evidence_result = investigation.collect_elasticsearch_evidence()
+        elif request.target_type == "node":
+            if not request.node:
+                return {
+                    "success": False,
+                    "error": "node is required when target_type is node",
+                }
+            evidence_result = investigation.collect_node_evidence(
+                request.node,
+                request.cluster,
+            )
         else:
             evidence_result = investigation.collect_target_evidence(
                 request.target_type

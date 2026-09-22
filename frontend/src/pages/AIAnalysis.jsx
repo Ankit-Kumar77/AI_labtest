@@ -185,6 +185,9 @@ export default function AIAnalysis() {
   const [namespace, setNamespace] = useSessionState("opensre:namespace", "");
   const [podName, setPodName] = useSessionState("opensre:pod", "");
 
+  const [nodes, setNodes] = useSessionState("opensre:nodes", []);
+  const [nodeName, setNodeName] = useSessionState("opensre:node", "");
+
   const [targetType, setTargetType] = useSessionState("opensre:targetType", "pod");
   const [dbHealth, setDbHealth] = useState(null);
   const [dbEvidence, setDbEvidence] = useState(null);
@@ -259,11 +262,16 @@ export default function AIAnalysis() {
       setPodsLoading(true);
 
       try {
-        const response = await api.get("/kubernetes/pods", {
-          params: { context: cluster },
-        });
+        const [podRes, nodeRes] = await Promise.all([
+          api.get("/kubernetes/pods", {
+            params: { context: cluster },
+          }),
+          api.get("/kubernetes/nodes", {
+            params: { context: cluster },
+          }),
+        ]);
 
-        const podLines = (response.data.stdout || "")
+        const podLines = (podRes.data.stdout || "")
           .split("\n")
           .slice(1)
           .filter(Boolean);
@@ -278,12 +286,26 @@ export default function AIAnalysis() {
           };
         });
 
+        const nodeData = (nodeRes.data.stdout || "")
+          .split("\n")
+          .slice(1)
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => {
+            const cols = line.split(/\s+/);
+            return { name: cols[0], status: cols[1] };
+          });
+
+        setNodes(nodeData);
+        if (nodeData.length > 0 && !nodeData.some((n) => n.name === nodeName)) {
+          setNodeName(nodeData[0].name);
+        }
         setPods(podData);
         setNamespace(podData[0]?.namespace || "");
         setPodName(podData[0]?.name || "");
         setInvestigation(null);
       } catch (err) {
-        console.error("Failed to load pods:", err);
+        console.error("Failed to load pods/nodes:", err);
         setPods([]);
         setNamespace("");
         setPodName("");
@@ -293,7 +315,7 @@ export default function AIAnalysis() {
     }
 
     loadPods();
-  }, [cluster, setInvestigation, setNamespace, setPodName, setPods]);
+  }, [cluster, setInvestigation, setNamespace, setNodeName, setNodes, setPodName, setPods]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -382,6 +404,7 @@ export default function AIAnalysis() {
 
   async function investigatePod() {
     if (targetType === "pod" && (!namespace || !podName)) return;
+    if (targetType === "node" && !nodeName) return;
 
     setLoading(true);
     setInvestigation(null);
@@ -395,6 +418,11 @@ export default function AIAnalysis() {
       if (targetType === "pod") {
         response = await api.get(
           `/opensre/investigate/pod/${namespace}/${podName}`,
+          { params: { context: cluster } }
+        );
+      } else if (targetType === "node") {
+        response = await api.get(
+          `/opensre/investigate/node/${encodeURIComponent(nodeName)}`,
           { params: { context: cluster } }
         );
       } else if (targetType === "stack") {
@@ -442,9 +470,11 @@ export default function AIAnalysis() {
       setInvestigationTarget(
         targetType === "pod"
           ? `${namespace}/${podName}`
-          : targetType === "stack"
-            ? "Full stack (all components)"
-            : targetType
+          : targetType === "node"
+            ? nodeName
+            : targetType === "stack"
+              ? "Full stack (all components)"
+              : targetType
       );
     } catch (err) {
       console.error(err);
@@ -469,6 +499,10 @@ export default function AIAnalysis() {
         payload.cluster = cluster;
         payload.namespace = namespace;
         payload.pod = podName;
+      } else if (targetType === "node") {
+        payload.target_type = "node";
+        payload.cluster = cluster;
+        payload.node = nodeName;
       } else {
         if (targetType === "stack") {
           payload.cluster = cluster;
@@ -557,7 +591,8 @@ export default function AIAnalysis() {
             disabled={
               loading ||
               podsLoading ||
-              (targetType === "pod" && (!namespace || !podName))
+              (targetType === "pod" && (!namespace || !podName)) ||
+              (targetType === "node" && !nodeName)
             }
           >
             {loading ? (
@@ -582,13 +617,52 @@ export default function AIAnalysis() {
               onChange={(e) => setTargetType(e.target.value)}
             >
               <option value="pod">Kubernetes pod</option>
+              <option value="node">Kubernetes node</option>
               <option value="aerospike">Aerospike</option>
               <option value="yugabyte">YugabyteDB</option>
               <option value="stack">Full stack</option>
             </select>
           </div>
 
-          {targetType === "pod" ? (
+          {targetType === "node" ? (
+            <>
+              <div className="field">
+                <label htmlFor="ai-node-cluster">Cluster</label>
+                <select
+                  id="ai-node-cluster"
+                  className="select"
+                  value={cluster}
+                  onChange={(e) => setCluster(e.target.value)}
+                  disabled={clusters.length === 0}
+                >
+                  {clusters.length === 0 && <option value="">No contexts</option>}
+                  {clusters.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="field">
+                <label htmlFor="ai-node">Node</label>
+                <select
+                  id="ai-node"
+                  className="select"
+                  value={nodeName}
+                  onChange={(e) => setNodeName(e.target.value)}
+                  disabled={podsLoading || nodes.length === 0}
+                >
+                  {nodes.length === 0 && <option value="">Loading…</option>}
+                  {nodes.map((node) => (
+                    <option key={node.name} value={node.name}>
+                      {node.name} · {node.status}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </>
+          ) : targetType === "pod" ? (
             <>
               <div className="field">
                 <label htmlFor="ai-cluster">Cluster</label>
@@ -859,51 +933,119 @@ export default function AIAnalysis() {
                     </div>
                   </div>
 
-                  {/* VictoriaMetrics pod metrics */}
+                  {/* VictoriaMetrics pod/node metrics */}
                   {vmMetrics && Object.keys(vmMetrics).length > 0 && (
                     <div className="report-section">
                       <div className="report-section__title">
                         <Activity size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-                        VictoriaMetrics (pod)
+                        VictoriaMetrics ({targetType === "node" ? "node" : "pod"})
                       </div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-3)" }}>
-                        <div className="report-metric">
-                          <div className="report-metric__label">Request rate</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.request_rate_rps != null ? vmMetrics.request_rate_rps.toFixed(2) : "—"} req/s
+
+                      {targetType === "node" ? (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-3)" }}>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Load average (1m)</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.load1 != null ? vmMetrics.load1.toFixed(2) : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">CPU utilization</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.cpu_utilization_percent != null ? `${vmMetrics.cpu_utilization_percent.toFixed(1)}%` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Memory utilization</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.mem_utilization_percent != null ? `${vmMetrics.mem_utilization_percent.toFixed(1)}%` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Disk usage {vmMetrics.root_fs_mountpoint || ""}</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.root_fs_utilization_percent != null ? `${vmMetrics.root_fs_utilization_percent.toFixed(1)}%` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Network RX</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.net_rx_bytes_per_s != null ? `${(vmMetrics.net_rx_bytes_per_s / 1048576).toFixed(2)} MiB/s` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Network TX</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.net_tx_bytes_per_s != null ? `${(vmMetrics.net_tx_bytes_per_s / 1048576).toFixed(2)} MiB/s` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Allocatable CPU</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.cpu_cores != null ? `${vmMetrics.cpu_cores} cores` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Total memory</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.mem_total_bytes != null ? `${(vmMetrics.mem_total_bytes / 1073741824).toFixed(2)} GiB` : "—"}
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Major page faults</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.major_page_faults_rps != null ? `${vmMetrics.major_page_faults_rps.toFixed(0)}/s` : "—"}
+                            </div>
+                          </div>
+                          {(vmMetrics.kube_node_pressure || []).length > 0 && (
+                            <div className="report-metric">
+                              <div className="report-metric__label">KSM conditions (active)</div>
+                              <div className="report-metric__value cell-mono" style={{ color: "var(--danger)", fontSize: 13 }}>
+                                {vmMetrics.kube_node_pressure.join(", ")}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: "var(--space-3)" }}>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Request rate</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.request_rate_rps != null ? vmMetrics.request_rate_rps.toFixed(2) : "—"} req/s
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Error rate (5xx)</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.error_rate_5xx_per_s != null ? vmMetrics.error_rate_5xx_per_s.toFixed(2) : "—"} /s
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">Error share</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.error_share_percent != null ? vmMetrics.error_share_percent.toFixed(2) : "—"}%
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">P50 latency</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.p50_latency_seconds != null ? (vmMetrics.p50_latency_seconds * 1000).toFixed(1) : "—"} ms
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">P95 latency</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.p95_latency_seconds != null ? (vmMetrics.p95_latency_seconds * 1000).toFixed(1) : "—"} ms
+                            </div>
+                          </div>
+                          <div className="report-metric">
+                            <div className="report-metric__label">P99 latency</div>
+                            <div className="report-metric__value cell-mono">
+                              {vmMetrics.p99_latency_seconds != null ? (vmMetrics.p99_latency_seconds * 1000).toFixed(1) : "—"} ms
+                            </div>
                           </div>
                         </div>
-                        <div className="report-metric">
-                          <div className="report-metric__label">Error rate (5xx)</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.error_rate_5xx_per_s != null ? vmMetrics.error_rate_5xx_per_s.toFixed(2) : "—"} /s
-                          </div>
-                        </div>
-                        <div className="report-metric">
-                          <div className="report-metric__label">Error share</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.error_share_percent != null ? vmMetrics.error_share_percent.toFixed(2) : "—"}%
-                          </div>
-                        </div>
-                        <div className="report-metric">
-                          <div className="report-metric__label">P50 latency</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.p50_latency_seconds != null ? (vmMetrics.p50_latency_seconds * 1000).toFixed(1) : "—"} ms
-                          </div>
-                        </div>
-                        <div className="report-metric">
-                          <div className="report-metric__label">P95 latency</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.p95_latency_seconds != null ? (vmMetrics.p95_latency_seconds * 1000).toFixed(1) : "—"} ms
-                          </div>
-                        </div>
-                        <div className="report-metric">
-                          <div className="report-metric__label">P99 latency</div>
-                          <div className="report-metric__value cell-mono">
-                            {vmMetrics.p99_latency_seconds != null ? (vmMetrics.p99_latency_seconds * 1000).toFixed(1) : "—"} ms
-                          </div>
-                        </div>
-                      </div>
+                      )}
                     </div>
                   )}
 
@@ -1036,14 +1178,33 @@ export default function AIAnalysis() {
             </span>
           </div>
         )}
+
+        {targetType === "node" && cluster && nodeName && (
+          <div className="chat__context">
+            <span className="chat__context-chip">
+              Cluster <span>{cluster || "—"}</span>
+            </span>
+            <span className="chat__context-chip">
+              Node <span>{nodeName || "—"}</span>
+            </span>
+          </div>
+        )}
         
-        {targetType === "pod" && (vmMetrics || esSignals) && (
+        {(targetType === "pod" || targetType === "node") && (vmMetrics || esSignals) && (
           <div className="chat__context" style={{ marginTop: "var(--space-2)", fontSize: 12 }}>
-            {vmMetrics && (
+            {vmMetrics && targetType === "pod" && (
               <span className="chat__context-chip" style={{ background: "var(--primary)", color: "white" }}>
                 <Activity size={10} style={{ marginRight: 2 }} />
                 {vmMetrics.request_rate_rps != null ? `${vmMetrics.request_rate_rps.toFixed(1)} req/s` : "no metrics"}
                 {vmMetrics.p99_latency_seconds != null ? ` · p99 ${(vmMetrics.p99_latency_seconds * 1000).toFixed(0)}ms` : ""}
+              </span>
+            )}
+            {vmMetrics && targetType === "node" && (
+              <span className="chat__context-chip" style={{ background: "var(--primary)", color: "white" }}>
+                <Activity size={10} style={{ marginRight: 2 }} />
+                {vmMetrics.load1 != null ? `load ${vmMetrics.load1.toFixed(2)}` : "no metrics"}
+                {vmMetrics.cpu_utilization_percent != null ? ` · cpu ${vmMetrics.cpu_utilization_percent.toFixed(0)}%` : ""}
+                {vmMetrics.mem_utilization_percent != null ? ` · mem ${vmMetrics.mem_utilization_percent.toFixed(0)}%` : ""}
               </span>
             )}
             {esSignals && esSignals.health?.success && (
@@ -1056,7 +1217,7 @@ export default function AIAnalysis() {
           </div>
         )}
 
-        {targetType !== "pod" && (
+        {targetType !== "pod" && targetType !== "node" && (
           <div className="chat__context">
             <span className="chat__context-chip">
               Target <span>{targetType}</span>

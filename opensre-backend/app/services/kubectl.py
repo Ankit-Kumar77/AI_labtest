@@ -504,6 +504,77 @@ def get_node_state(node_name: str, context: str | None = None):
     }
 
 
+def get_node_details(node_name: str, context: str | None = None):
+    """Raw `kubectl describe node` output (conditions, taints, resource usage)."""
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(["describe", "node", node_name])
+    return run_command(command)
+
+
+def get_node_events(
+    node_name: str,
+    context: str | None = None,
+):
+    """Raw `kubectl get events` filtered to the Node object (text form)."""
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(
+        [
+            "get",
+            "events",
+            "--field-selector",
+            f"involvedObject.kind=Node,involvedObject.name={node_name}",
+            "--sort-by=.metadata.creationTimestamp",
+        ]
+    )
+    return run_command(command)
+
+
+def get_node_events_json(
+    node_name: str,
+    context: str | None = None,
+):
+    """
+    Structured Node events (`kubectl get events -o json` filtered to the
+    Node object) for timeline-ready reason/type/timestamp extraction.
+    """
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(
+        [
+            "get",
+            "events",
+            "--field-selector",
+            f"involvedObject.kind=Node,involvedObject.name={node_name}",
+            "--sort-by=.metadata.creationTimestamp",
+            "-o",
+            "json",
+        ]
+    )
+
+    result = run_command(command)
+
+    if not result.get("success"):
+        return result
+
+    try:
+        data = json.loads(result.get("stdout", "{}"))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "stderr": "unable to parse node events json",
+        }
+
+    return {
+        "success": True,
+        "items": data.get("items", []) or [],
+    }
+
+
 def cordon_node(node_name: str, context: str | None = None):
     command = ["kubectl"]
     if context:

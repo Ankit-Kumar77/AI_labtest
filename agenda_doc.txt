@@ -1,0 +1,427 @@
+==========================================================================
+ OpenSRE Dashboard — Demo Agenda (detailed, code-accurate)
+==========================================================================
+Stack: FastAPI backend (port 8001) + React frontend (port 5173) +
+       Kind cluster "opensre-demo" + VictoriaMetrics + Grafana + ELK
+       (Elasticsearch / Kibana / Fluent Bit) + OTel collector +
+       Nginx + YugabyteDB + Aerospike. RCA / evidence grounded in live
+       data, nothing hardcoded; all failure scenarios are controlled and
+       reversible (fail -> investigate -> recover).
+
+Demo environment that must be live before the session:
+  - Kind cluster:            opensre-demo (kubectl context kind-opensre-demo)
+  - Backend:                 http://localhost:8001  (uvicorn app.main:app)
+  - Frontend:                http://localhost:5173  (npm run dev)
+  - Port forwards (observability): Elasticsearch :9200, Kibana :5601,
+      VictoriaMetrics :8428, OTel gRPC/HTTP :4317/:4318
+  - Port forwards (databases):  YugabyteDB :5433, Aerospike :3001->3000
+  - Grafana:                 :3000 (helm chart), Kibana NodePort 30001
+
+--------------------------------------------------------------------------
+1. HOW WE WERE ABLE TO WRITE THE "PLUGINS" (integrations)
+--------------------------------------------------------------------------
+What the audience sees: each demo can inject a failure, investigate it, and
+recover — as if we "rolled our own plugins" for OpenSRE. What really happens:
+
+a) OpenSRE CLI as the AI core (not a custom model):
+   - Binary:  /home/subrata/.local/bin/opensre (v0.1.2026.9.1+main.eee45fa)
+   - Subcommands used: investigate, doctor, status, onboard.
+   - CLI config: ~/.opensre/opensre.json  -> target "local", provider
+     "gemini", default model gemini-3.1-flash-lite-preview.
+   - Every analysis is issued as:
+        opensre investigate --input-json '<alert|evidence JSON>'
+     (backend helper: opensre-backend/app/services/opensre_cli.py)
+
+b) The "plugin" is really two layers WE wrote in the backend:
+   1) Integration service module (app/services/<system>.py) — a self-
+      contained, READ-ONLY adapter that normalizes a system into bounded,
+      structured evidence. Each exposes functions like:
+        health(), <query>/log_analysis(), and a collector returning
+        structured dicts (capped tails, never streaming the whole log).
+      Examples:
+        nginx.py         ingress health + `nginx -t`/`nginx -T` + log decode
+        yugabyte.py      read-only SQL connector (only SELECT/WITH/SHOW/
+                         EXPLAIN/DESCRIBE; mutation keywords rejected)
+        aerospike.py     aerospike client, scans capped (MAX_SCAN_RECORDS)
+        elasticsearch.py ELK pattern queries (ERROR/EXCEPTION/FAILED/
+                         CONNECTION REFUSED/TIMEOUT)
+        coredns.py       DNS health + live in-cluster resolution probe
+        github.py        GitHub API (commits/branches/issues/workflows)
+        grafana.py       Grafana health/datasources/dashboards
+        victoriametrics.py  VM queries (rates, latency percentiles)
+        kubectl.py       cluster / nodes / pods / services / deployments
+   2) Orchestration (app/services/investigation.py) — collect_*_evidence()
+      helpers bundle pod/node/coreDNS/nginx/ELK/db/VM/Grafana/git evidence,
+      fold in a grounded `question`, and hand it to opensre_cli.investigate().
+   The result (markdown RCA) is auto-saved via incident_history for the
+   Incident Report page.
+
+c) Demo scenarios are a THIRD layer (app/routes/*_demo.py) — each
+   implements a deterministic fail -> investigate -> recover flow whose
+   failure injection delegates to chaos/runbook.sh (real kubectl actions)
+   and falls back to synthetic signals only when no cluster is reachable.
+
+d) Inbound alerts (Grafana / Alertmanager / bare) are normalized into one
+   object by _parse_alert_payload() in app/routes/opensre.py, then
+   investigate() never forwards a bare alert: it collects evidence first
+   and only then runs OpenSRE (grounded RCA, "Non-Validated Claims" avoided).
+
+Pattern to mention in the talk: "adapter + bounded evidence + demo route +
+opensre investigate --input-json". That is how the integrations were written.
+
+--------------------------------------------------------------------------
+2. GITHUB ISSUE CORRELATION
+--------------------------------------------------------------------------
+Implemented and demoable.
+- Service:    app/services/github.py  (GitHubClient, REST via httpx)
+              app/services/git_correlation.py
+  Config:     GITHUB_TOKEN + GITHUB_REPO (7thGarden/AI_labtest) in
+              opensre-backend/.env; default branch correlation.
+- API routes: app/routes/github.py (prefix /api/github)
+     GET /health        -> repo connection status
+     GET /branches      -> branch list
+     GET /commits?sha&since&until&limit
+     GET /workflows     -> Actions runs
+     GET /issues?state  -> open/closed issues
+     GET /repo
+     GET /workflow-runs/{id}/jobs        -> jobs + failed-step log snippets
+     GET /workflow-runs/{id}/investigate -> evidence + OpenSRE RCA
+- Correlation logic (git_correlation.py): given an incident start time,
+  finds the newest commit at-or-before that time and marks it as the
+  "suspected change-point", plus a window of commits before the incident.
+  This is a read-only GitHub API lookup (never writes/pushes).
+- Where it shows up: the GitHub page + every investigation demo degrades
+  through the same collector — evidence digest lines like
+  "suspected change-point commit ab12cd7 'message' (date)".
+- Demo one-liner flow:
+     1) Open GitHub page (frontend /github).
+     2) Pick a workflow run, hit "Investigate" ->
+        /api/github/workflow-runs/{id}/investigate.
+     3) Or trigger any scenario below and point out the "git history"
+        block in the RCA.
+- Note: this is commit correlation and GitHub issues listing — not an
+  outbound "open a GitHub issue" action.
+
+--------------------------------------------------------------------------
+3. NGINX INTEGRATION AND CONFIGURATION ISSUES
+--------------------------------------------------------------------------
+Implemented and demoable.
+- Deployment: infra/k8s/nginx-deployment.yaml (+ nginx-service.yaml) in
+  namespace opensre, image nginx:1.27-alpine, probes hit /healthz.
+- ConfigMap:  infra/k8s/nginx-configmap.yaml — structured access log
+  (log_format "main" with rt/uct/upstream_status/uaddr), plus two
+  observability endpoints /nginx-health and /nginx-status; upstream is
+  catalog-api.opensre.svc.cluster.local:8000. This is what lets the demo
+  decode upstream timing/502/503/504 from logs.
+- Service:    app/services/nginx.py
+     health()                    pod phase/readiness + restart counts
+     nginx_config_test()         runs `nginx -t` inside the pod
+     nginx_config_dump()         runs `nginx -T` (effective config, capped)
+     get_nginx_logs(), analyze_logs()  parse access/error logs; error
+     patterns incl. connection_refused, upstream_timeout, dns_failures.
+- API routes: app/routes/nginx.py (prefix /api/nginx)
+     GET /health  GET /config/validate  GET /config/dump
+     GET /logs    GET /logs/analysis    GET /evidence  GET /investigate
+  Plus the closed-loop demo: app/routes/nginx_demo.py
+     POST /api/demo/nginx/fail?mode=broken_upstream | broken_dns
+     POST /api/demo/nginx/investigate
+     POST /api/demo/nginx/recover
+- Demo one-liner flow:
+     1) Frontend Nginx page -> "Inject failure" (broken upstream = 502/504
+        storm from catalog-api, or broken DNS = upstream hostname fails to
+        resolve).
+     2) Investigate -> /api/nginx/investigate collects nginx evidence +
+        K8s/VM/GitHub correlation; RCA points at the broken upstream/DNS.
+     3) Recover -> config restored, /api/nginx/health + logs show green.
+  - Show /api/nginx/config/validate (nginx -t) while broken vs. after fix.
+
+--------------------------------------------------------------------------
+4. YUGABYTE ISSUES
+--------------------------------------------------------------------------
+Implemented and demoable.
+- Connector:  app/services/yugabyte.py (psycopg2 against yugabytedb at
+  :5433, DB "yugabyte"). Read-only guard: READ_ONLY_SQL_PREFIXES =
+  SELECT/WITH/SHOW/EXPLAIN/DESCRIBE; FORBIDDEN_SQL_KEYWORDS on mutation
+  verbs. Mutations only via execute_raw() used by the demo seeder.
+  Exposed: health, cluster_health, connection_status, slow_queries,
+  recent_errors, schema_info, record_inspection, data_integrity_checks,
+  table_statistics, replication_status.
+- K8s: StatefulSet "yugabytedb" in namespace databases; port-forward
+  svc/yugabytedb 5433:5433.
+- Demo scenarios (app/routes/demo.py /api/demo/**), each fail->investigate->
+  recover, DB-bin inclusive:
+     db-scenario/unavailable      scale StatefulSet -> 0 (connection refused)
+     db-scenario/latency          create latency_test table w/ 100 rows +
+                                  unindexed LIKE query (slow query signal)
+     db-scenario/connection-pressure  concurrent-like queries / big writes
+     db-scenario/data-integrity   integrity_test: duplicate emails, NULL/
+                                  empty names, negative counts (CHECK), dup
+                                  PKs; plus insert-empty/duplicates/invalid
+     db-failure/{fail,investigate,recover}  the "stop the database" demo
+- API routes: app/routes/db_investigation.py (prefix /api/databases):
+     GET  /yugabyte/health
+     GET  /yugabyte/evidence          (or via /investigate/target/yugabyte)
+     POST /yugabyte/custom-query ...
+- Frontend: Yugabyte page (/yugabyte) — schema browser, slow_queries,
+  record inspection, integrity checks; run scenario + "Investigate with
+  OpenSRE".
+- Important recovery detail: scaling StatefulSet to 0 kills the DB
+  port-forward, so recover() re-runs kubectl port-forward automatically
+  (services/portforward.py) and waits on `kubectl rollout status --timeout=240s`
+  (YugabyteDB cold start ~2-3 min). Note it for the audience.
+
+--------------------------------------------------------------------------
+5. AEROSPIKE ISSUES
+--------------------------------------------------------------------------
+Implemented and demoable (mirror structure of item 4).
+- Connector:  app/services/aerospike.py (aerospike client, hosts from
+  AEROSPIKE_HOSTS). health, query/write/delete, scan (capped,
+  MAX_SCAN_RECORDS), cluster_health, namespace_info, record_inspection,
+  operation_errors, data_integrity_checks, namespace_set_stats, latency_info.
+- K8s: StatefulSet "aerospike" in namespace databases; port-forward
+  svc/aerospike 3001:3000.
+- Demo scenarios (same route set as item 4, target="aerospike"):
+     unavailable          scale StatefulSet -> 0
+     latency              write 200 x 5 KB records into set "latency" +
+                          scan (namespace_set_stats / latency_info show it)
+     connection-pressure  records + repeated scans keep connections busy
+     data-integrity       integrity set: missing "name", overwritten dup
+                          keys, negative "count" values, invalid emails
+                          (aerospike.data_integrity_checks surfaces them)
+     db-failure/*         the "stop the database" demo
+- API routes: app/routes/aerospike.py + app/routes/db_investigation.py
+  (GET /api/databases/aerospike/health|evidence).
+- Frontend: Aerospike page (/aerospike) — namespace/set stats, record
+  inspection, operation errors, integrity checks.
+
+--------------------------------------------------------------------------
+6. GRAFANA INTEGRATION
+--------------------------------------------------------------------------
+Implemented and demoable.
+- Deploy:      observability/install.sh installs grafana (helm chart,
+  pinned 10.5.15) with observability/grafana-values.yaml; port-forward
+  svc/grafana :3000 (admin creds from the chart secret).
+- Service:     app/services/grafana.py — health(), datasources(),
+  dashboards(), dashboard_summary(uid). Dashboards for this demo live under
+  UID "opensre-overview" (GRAFANA_DASHBOARD_UID in investigation.py).
+- Integration surface:
+     GET /api/grafana/health        app/routes/grafana-related endpoints
+     Grafana summary is folded into every collect_*_evidence() via
+     _collect_grafana_summary() (investigation.py).
+     Chart dashboards: Grafana overview panels over VictoriaMetrics
+     (request rates, error %, p50/p95/p99 latency).
+- Frontend: Metrics page (/metrics) reads the same VM series; Grafana is
+  linked from the UI and shown to correlate the RCA with graphs.
+- Demo flow: run the nginx or catalog-api latency failure (below), then on
+  Grafana show the 5xx / latency spike the RCA is citing.
+
+--------------------------------------------------------------------------
+7. ALERTMANAGER INTEGRATION
+--------------------------------------------------------------------------
+PARTIALLY implemented — flag this honestly in the demo.
+Current state in the codebase:
+  - No Alertmanager deployment in the observability stack (no helm chart in
+    observability/install.sh, no /infra/k8s alerting manifests).
+  - What DOES exist is the inbound alert path: app/routes/opensre.py
+    _parse_alert_payload() accepts a real Alertmanager webhook body
+    ({ "alerts": [ { labels, annotations, ... } ] }), a Grafana notification,
+    or a bare alert object, normalizes to one alert, collects evidence
+    (investigation.collect_alert_evidence) and runs OpenSRE grounded RCA —
+    never forwarding a bare payload.
+  - README and payload-normalization code reference Alertmanager
+    (README ~lines 788/1249; opensre.py ~lines 66/78).
+Demo script:
+    1) POST /api/opensre/investigate with a hand-crafted Alertmanager-format
+       webhook JSON (e.g. a firing "WorkflowFailed" / DB-down alert with
+       labels + annotations). Show it is normalized and enriched with live
+       evidence, not triaged blindly.
+    2) Show the Incident Report page entry that is auto-saved.
+    3) Optionally explain the roadmap line: wiring a real Alertmanager helm
+       chart + VM alerting rules to actually emit these webhooks.
+Likewise, no Alertmanager-to-broadcast/notification receivers are present;
+do not claim notification delivery exists.
+
+--------------------------------------------------------------------------
+8. KUBERNETES INTEGRATION (POD LOGS, EVENTS, CORE DNS LATENCY)
+--------------------------------------------------------------------------
+Implemented and demoable.
+- kubectl service: app/services/kubectl.py + app/routes/kubernetes.py
+  (prefix /api/kubernetes): GET /clusters /nodes /pods /services
+  /deployments; plus pod detail helpers used by the evidence collectors.
+- Pod-level RCA: app/services/investigation.py collect_pod_evidence()
+  (logs, events, VM pod metrics) and app/services/k8s_log_analysis.py
+  (extract_relevant_lines, summarize_signals, parse_events,
+  build_timeline). Enriched API responses also attach VM metrics + ES
+  signals (routes/opensre.py /investigate/pod/...).
+- OpenSRE chat/scoped endpoints:
+     GET /api/opensre/investigate/pod/{ns}/{pod}
+     GET /api/opensre/investigate/node/{node}
+     POST /api/opensre/chat  (target_type = node | pod | coredns | elk |
+                              yugabyte | aerospike | stack)
+- Node / unhealthy-pod / node-failure demos: app/routes/demo.py
+     /api/demo/unhealthy-pod/deploy|delete|status  (order-service-bad
+        crash-loop pod logging "connection refused yugabyte:5433")
+     /api/demo/node-failure/fail|investigate|recover|health   (cordon +
+        stress pod on opensre-demo-worker)
+- CoreDNS (the "Core DNS Latency" agenda point):
+     Service: app/services/coredns.py
+       - get_coredns_pods/health/logs/events, service_and_endpoints
+       - analyze_logs() LOG_PATTERNS: SERVFAIL, timeout, refused,
+         plugin/forward, loop, NXDOMAIN
+       - dns_probe() — live read-only `kubectl exec python3` from an app
+         pod doing N timed getaddrinfo against kube-dns; verdict ok/
+         degraded/slow/failing with thresholds 200ms warn / 1000ms high
+       - coredns_vm_metrics() — kube-state-metrics restart/phase series;
+         native coredns_dns_* only if scraped (reported honestly when absent)
+     Routes: app/routes/coredns.py (/api/coredns health etc.) +
+             app/routes/coredns_demo.py (/api/demo/coredns)
+       modes: kill (delete one pod, self-heal) | down (scale to 0) |
+              latency (worker netem) — fail -> investigate -> recover via
+       chaos/runbook.sh (coredns-kill / coredns-down / coredns-latency /
+       coredns-up / coredns-latency-off). The DNS probe average latency is
+       cited in the RCA.
+- Failure catalogue you can reference on the Kubernetes page: chaos/runbook.sh
+  (pod-crash, pod-delete, pod-cpu, pod-memory, pod-latency, flaky-latency,
+  system-pod-kill, coredns-*, node-cordon, node-drain, node-network-latency).
+
+--------------------------------------------------------------------------
+9. ELK INTEGRATION (ERRORS, EXCEPTIONS, FAILED, CONNECTION REFUSED, TIMEOUTS)
+--------------------------------------------------------------------------
+Implemented and demoable.
+- Pipeline:
+     catalog-api (structured JSON logs, catalog-api/app/core/logging.py
+       JsonFormatter emits timestamp/service/level/message/error/request_id)
+          -> pod stdout -> Fluent Bit DaemonSet
+       (observability/fluent-bit.yaml: tail input /var/log/containers/*.log,
+       kubernetes filter, nest lift -> k8s_* fields)
+          -> Elasticsearch (helm, 8.5.1, observability/es-values.yaml)
+       index template logs-opensre-* with ILM policy logs-opensre-policy
+       (observability/install.sh creates template + policy + Kibana index).
+          -> Kibana (helm, NodePort 30001, port-forward 5601)
+- Service:  app/services/elasticsearch.py — PATTERNS dict mapping
+  ERROR / EXCEPTION / FAILED / CONNECTION REFUSED / TIMEOUT to the
+  fluent-bit field names; queryable by namespace/pod/service.
+  evidence via investigation.collect_elasticsearch_evidence() +
+  routes/opensre.py GET /api/opensre/investigate/elk.
+- Demo: app/routes/elk_demo.py (prefix /api/demo/elk): SYNTHETIC_LOGS for
+  the three failure classes —
+     error              mode call catalog-api /failure/error
+     connection-refused mode catalog-api /failure/connection-refused
+     timeout            mode catalog-api /failure/timed-out|slow
+  fail -> (see it land in ES/Kibana) -> investigate -> recover.
+  chaos/runbook.sh also has elk-error, elk-connection-refused, elk-timeout
+  injections via the catalog-api failure API.
+- Frontend: Logs page (/logs) queries Elasticsearch for the five patterns;
+  K8S page "Log Analysis" surfaces per-pod signal summaries.
+- Kibana walk-through: filter logs-opensre-* for "CONNECTION REFUSED" or
+  "TIMED OUT", show the k8s_pod_name field, then Investigate.
+
+--------------------------------------------------------------------------
+10. NATS.IO INTEGRATION  (* NOT implemented in this codebase *)
+--------------------------------------------------------------------------
+Honest status: no NATS components exist here. No service module, no routes,
+no NATS workload in the cluster. If the agenda item must be shown as-is,
+re-label this block in the deck as "roadmap / how we'd add it" and demo the
+empty state on the integrations page (or skip it):
+
+Proposed integration (following the pattern in item 1):
+  - Service module app/services/nats.py:
+      health()       -> NATS GET /healthz on the monitoring port
+      subjects()     -> list server subjects/connz via NATS monitoring API
+      consumer_lag() -> stream + consumer info (lag, pending messages)
+      events()       -> recent/exceeded-delivery records
+   All read-only over the REST monitoring endpoint (port 8222 on the NATS
+   server) or a short-lived nats client for stats.
+  - Routes /api/nats/* (health, evidence) + a demo route with
+    fail (stop the NATS server / scale to 0) -> investigate -> recover,
+    wiring nats evidence into investigation.collect_*_evidence and the same
+    opensre investigate --input-json call.
+  - Supported failure signals to inject: consumer stoppage (inflight
+    growth), subject pub rates, stream > max_age messages pending.
+
+DO NOT claim a working NATS demo without adding the above.
+
+--------------------------------------------------------------------------
+11. KEYCLOAK INTEGRATION  (* NOT implemented in this codebase *)
+--------------------------------------------------------------------------
+Honest status: no Keycloak deployment, service module, or routes.
+Same guidance as item 10: mark as roadmap.
+Proposed integration:
+  - Add Keycloak to the stack (helm bitnami/keycloak, or docker only
+    locally since the demo DBs now run in-cluster).
+  - Service module app/services/keycloak.py:
+      health()   -> GET /realms/<realm> (admin realm endpoint)
+      realm_info(), clients(), users()
+      token_audit() -> recent failed logins / token issuance
+      keycloak_metrics() -> VM/OTel if the Prometheus endpoints are enabled
+   Read-only (openid config / admin REST with a fine-grained client).
+  - Routes /api/keycloak/health|evidence and a fail->investigate->recover
+    demo (scale deployment to 0, or block the app->keycloak token call and
+    let the RCA correlate "401 Unauthorized" log evidence from catalog-api
+    into the Keycloak outage).
+Mark clearly in the deck that this is a future work item being demoed only
+as architecture (adapter + evidence + demo route pattern).
+
+--------------------------------------------------------------------------
+12. JENKINS INTEGRATION  (* NOT implemented in this codebase *)
+--------------------------------------------------------------------------
+Honest status: no Jenkins workload, module, or routes. Roadmap only.
+Proposed integration:
+  - Deploy Jenkins (helm jenkinsci/jenkins, NodePort for the UI; scripted
+    pipeline stub in infra/k8s/jenkins/).
+  - Service module app/services/jenkins.py:
+      health()      -> GET /api/json (crumb/status)
+      jobs()        -> failed/aborted recent builds
+      build_stats() -> last N builds per job (duration, result)
+      log_tail(job, build) -> failed console-log snippets
+   Read-only via the remote API token; never trigger builds.
+  - Routes /api/jenkins/health|evidence + demo:
+      fail  -> break the build pipeline (or stop the Jenkins deployment)
+      investigate -> jenkins evidence + downstream pod/nodes + git
+                     correlation (a job pushed the bad commit -> ties into
+                     the GitHub change-point correlation of item 2)
+      recover -> restart deployment / fix pipeline, show green last build.
+Present as roadmap; the architecture is identical to the working items 1-9.
+
+==========================================================================
+CLOSED-LOOP SCRIPT FOR A FULL 20-30 MIN WALK
+==========================================================================
+00-03  Overview + stack: frontend Dashboard, backend /api/opensre/doctor
+03-06  (1) "Plugins": how integration adapters + evidence + demo routes are
+       written; opensre investigate --input-json under the hood.
+06-10  (2) GitHub correlation: workflow run investigate; suspected change
+       point commit shown in RCA.
+10-14  (3)+(8) Nginx broken upstream -> /api/nginx/investigate -> recover;
+       K8s pod logs/events + CoreDNS latency demo (kill/down/latency).
+14-18  (4)+(5) YugabyteDB + Aerospike: pick unavailable OR latency OR
+       data-integrity scenario on each page -> investigate -> recover
+       (watch the automatic port-forward restart on recover).
+18-21  (6)+(7) Grafana dashboards showing the spike the RCA cites; then
+       Alertmanager-format webhook into /api/opensre/investigate and the
+       Incident Report page.
+21-25  (9) ELK: trigger catalog-api error/connection-refused/timeout, show
+       the log in Kibana (logs-opensre-*), run /api/opensre/investigate/elk.
+25-30  (10-12) Roadmap: NATS / Keycloak / Jenkins as adapter+evidence+demo
+       pattern (flag honest status), Q&A.
+
+Key endpoint map (backend :8001):
+  /api/opensre                     version, doctor, status, investigate,
+                                   investigate/pod|node|target|stack|coredns|elk, chat
+  /api/nginx[+ /demo/nginx]        health, config validate/dump, logs(+analysis),
+                                   evidence, investigate, fail/recover
+  /api/demo/*                      db-failure, db-scenario/*, node-failure,
+                                   unhealthy-pod, elk, coredns, nginx demos
+  /api/databases                   yugabyte + aerospike health/evidence
+  /api/kubernetes                  clusters, nodes, pods, services, deployments
+  /api/github                      health, branches, commits, issues, workflows,
+                                   workflow-run jobs/investigate
+  /api/metrics /api/grafana        VM queries + Grafana health
+  /api/incidents                   saved OpenSRE investigations (Incident page)
+  /api/chaos                       runbook-backed failure actions
+Learn/reference files for the talk:
+  opensre-backend/app/services/*.py        the integration "plugins"
+  opensre-backend/app/services/investigation.py   evidence orchestration
+  opensre-backend/app/routes/{nginx,elk,coredns,db_investigation,demo}_*.py
+  chaos/runbook.sh, chaos/README.md         failure catalogue
+  observability/*.yaml, observability/install.sh, observability/start-ports.sh
+  infra/k8s/*                               nginx / yugabytedb / aerospike / elk / faults

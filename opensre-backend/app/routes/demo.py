@@ -322,45 +322,21 @@ def node_investigate(request: NodeRequest):
     node = request.node
     ctx = request.context
 
-    # Collect node state
-    node_state = kubectl.get_node_state(node, ctx)
-    node_usage = kubectl.get_node_resource_usage(node, ctx)
+    # Collect comprehensive node evidence (state, describe, events,
+    # per-pod failure signals, node-exporter/KSM metrics, ES signals).
+    evidence_result = investigation.collect_node_evidence(node, ctx)
 
-    # Get node conditions for evidence summary
-    conditions = []
-    if node_state.get("success"):
-        for c in (node_state.get("node") or {}).get("conditions", []) or []:
-            if c.get("status") != "True":
-                continue
-            conditions.append(f"{c['type']}={c['status']} ({c.get('reason', '')})")
+    if not evidence_result.get("success"):
+        return {
+            "success": False,
+            "node": node,
+            "error": evidence_result.get("error", "Unable to collect node evidence"),
+        }
 
-    # Collect stack-level evidence (includes Kubernetes + VM + Grafana)
-    evidence_result = investigation.collect_stack_evidence(ctx)
+    evidence = evidence_result.get("evidence", {})
 
-    evidence = evidence_result.get("evidence", {}) if evidence_result.get("success") else {}
-
-    # Inject the node problem into evidence for OpenSRE
-    evidence["node_problem"] = {
-        "node": node,
-        "unschedulable": (node_state.get("node") or {}).get("unschedulable", False) if node_state.get("success") else None,
-        "conditions": conditions,
-        "pod_count": node_usage.get("pod_count"),
-        "restarts_total": node_usage.get("restarts_total"),
-        "pods": node_usage.get("pods", []),
-    }
-
-    evidence["target"] = {
-        "type": "node",
-        "name": node,
-    }
-
-    # Build a question for OpenSRE
-    evidence["question"] = (
-        f"The Kubernetes node {node} is reporting as SchedulingDisabled "
-        f"and has {node_usage.get('restarts_total', 0)} pod restarts across "
-        f"{node_usage.get('pod_count', 0)} pods. "
-        f"What is causing this node degradation and what should be done?"
-    )
+    node_state = evidence.get("kubernetes", {}).get("state") or {}
+    node_usage = evidence.get("kubernetes", {}).get("node_usage") or {}
 
     # Run OpenSRE
     opensre_result = opensre_cli.investigate(evidence)

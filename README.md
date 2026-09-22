@@ -800,6 +800,35 @@ Target detection: the alert `labels` `pod` / `kubernetes_pod_name` /
 a pod, a full-stack crash story (cluster metrics, scrape health, degraded pods)
 is attached instead.
 
+### Node-level investigations
+
+Node analysis is available from the **AI Analysis** page (Target →
+`Kubernetes node`) and the **Kubernetes** page (an `Investigate` button on every
+node row). Both funnel into one evidence collector
+(`investigation.collect_node_evidence`) covering:
+
+- `kubectl get node` state (conditions / taints / allocatable),
+  `describe node`, and both raw + structured node events (timeline-ready)
+- every pod scheduled on the node, with deep-dive signals on degraded or
+  restarted pods (state reasons, current + `--previous` container logs)
+- node-exporter + kube-state-metrics numbers: load1/5/15, CPU and memory
+  utilization, largest backing-filesystem usage, network RX/TX and disk rates,
+  major page faults, KSM-reported conditions/pressure, allocatable/capacity
+- Elasticsearch signals aggregated across the node's degraded pods (ES has no
+  `k8s_node_name` field, so per-pod queries are grouped)
+- CoreDNS/DNS health and GitHub commit correlation
+
+Routes: `GET /api/opensre/investigate/node/{node_name}` (RCA + `vm_metrics` +
+`es_signals`), `POST /api/demo/node-failure/investigate`, and the `node` target
+in `POST /api/opensre/chat`.
+
+> **Model quota note:** the OpenSRE CLI uses the Gemini free tier, which is
+> hard-capped (e.g. 20 requests/day per model plus per-minute token limits). A
+> single investigation runs a multi-step agent loop and can exhaust the daily
+> budget; evidence collection still works and the UI surfaces the 429 as an
+> "investigation failed" report. Space investigations out or switch the CLI to
+> a paid provider for high-volume triage.
+
 ---
 
 ## Aerospike

@@ -1,4 +1,5 @@
 import socket
+from datetime import datetime, timezone
 
 from app.core.config import settings
 from app.services import aerospike
@@ -66,6 +67,262 @@ def _vm_scalar(query: str):
         return None
 
     return None
+
+
+def _vm_series(query: str):
+    """Return raw {metric, value} series for a VM instant query (bounded)."""
+    try:
+        result = victoriametrics.query(query)
+        if not result.get("success"):
+            return []
+        series = result.get("data", {}).get("data", {}).get("result", [])
+        return [
+            {
+                "metric": s.get("metric", {}),
+                "value": s.get("value", [None, None])[1],
+            }
+            for s in (series or [])[:50]
+        ]
+    except (KeyError, IndexError, TypeError, ValueError):
+        return []
+
+
+def _collect_node_metrics(node_name: str):
+    """
+    Node-level metrics from node-exporter (job=node) and kube-state-metrics:
+    load, CPU, memory, root-filesystem pressure, network + disk rates and the
+    KSM-reported node conditions. Returns None-free dict (keys omitted when
+    the metric is absent so OpenSRE never sees fabricated zeros).
+    """
+    label = f'node="{node_name}"'
+    metrics: dict = {}
+
+    for key, query in (
+        ("load1", f"node_load1{{{label}}}"),
+        ("load5", f"node_load5{{{label}}}"),
+        ("load15", f"node_load15{{{label}}}"),
+        ("cpu_cores", f"count(node_cpu_seconds_total{{mode=\"idle\",{label}}})"),
+        (
+            "cpu_used_cores",
+            f"sum(rate(node_cpu_seconds_total{{mode!=\"idle\",{label}}}[5m]))",
+        ),
+        ("mem_available_bytes", f"node_memory_MemAvailable_bytes{{{label}}}"),
+        ("mem_total_bytes", f"node_memory_MemTotal_bytes{{{label}}}"),
+        ("mem_buffers_bytes", f"node_memory_Buffers_bytes{{{label}}}"),
+        ("mem_cached_bytes", f"node_memory_Cached_bytes{{{label}}}"),
+        (
+            "net_rx_bytes_per_s",
+            f"sum(rate(node_network_receive_bytes_total{{device!=\"lo\",{label}}}[5m]))",
+        ),
+        (
+            "net_tx_bytes_per_s",
+            f"sum(rate(node_network_transmit_bytes_total{{device!=\"lo\",{label}}}[5m]))",
+        ),
+        (
+            "disk_read_bytes_per_s",
+            f"sum(rate(node_disk_read_bytes_total{{{label}}}[5m]))",
+        ),
+        (
+            "disk_written_bytes_per_s",
+            f"sum(rate(node_disk_written_bytes_total{{{label}}}[5m]))",
+        ),
+        ("major_page_faults_rps", f"node_vmstat_pgmajfault{{{label}}}"),
+        ("open_fds", f"max(node_filefd_allocated{{{label}}})"),
+        (
+            "proc_running",
+            f"sum(node_procs_running{{{label}}})",
+        ),
+    ):
+        value = _vm_scalar(query)
+        if value is not None:
+            metrics[key] = value
+
+    if metrics.get("cpu_cores") and metrics.get("cpu_used_cores") is not None:
+        metrics["cpu_utilization_percent"] = round(
+            metrics["cpu_used_cores"] / max(metrics["cpu_cores"], 1e-6) * 100,
+            2,
+        )
+
+    mem_avail = metrics.get("mem_available_bytes")
+    mem_total = metrics.get("mem_total_bytes")
+    if mem_avail is not None and mem_total:
+        metrics["mem_utilization_percent"] = round(
+            (mem_total - mem_avail) / max(mem_total, 1e-6) * 100, 2
+        )
+
+    # Root-filesystem pressure: pick the largest real (non-tmpfs/ramfs)
+    # mountpoint and report its used percent. Robust across kind/minikube
+    # where "/" may be an overlay or a sub-volume.
+    fs = _vm_series(f"node_filesystem_size_bytes{{{label}}}")
+    usable = [
+        s
+        for s in fs
+        if (s["metric"].get("fstype") or "") not in ("tmpfs", "ramfs", "overlay")
+        and s["metric"].get("mountpoint")
+    ]
+    if usable:
+        biggest = max(usable, key=lambda s: float(s["value"] or 0))
+        mountpoint = biggest["metric"]["mountpoint"]
+        avail = _vm_scalar(
+            f"node_filesystem_avail_bytes{{mountpoint=\"{mountpoint}\",{label}}}"
+        )
+        if avail is not None:
+            total = float(biggest["value"] or 0)
+            metrics["root_fs_mountpoint"] = mountpoint
+            metrics["root_fs_size_bytes"] = round(total, 4)
+            metrics["root_fs_avail_bytes"] = avail
+            metrics["root_fs_utilization_percent"] = round(
+                (total - avail) / max(total, 1e-6) * 100, 2
+            )
+
+    # KSM-reported node conditions: the `status` LABEL holds the current
+    # condition value and the metric value (1/0) marks whether that state is
+    # active. We keep only the currently-active state per condition type.
+    conditions = _vm_series(f"kube_node_status_condition{{{label}}}")
+    condition_summary = []
+    for item in conditions:
+        if (item.get("value") or "0").strip() != "1":
+            continue
+        condition_summary.append(
+            {
+                "type": item["metric"].get("condition"),
+                "status": item["metric"].get("status"),
+            }
+        )
+    if condition_summary:
+        metrics["kube_node_conditions"] = condition_summary
+        metrics["kube_node_pressure"] = [
+            c["type"] for c in condition_summary
+            if c["status"] == "true" and c["type"] != "Ready"
+        ]
+
+    allocatable = _vm_series(f"kube_node_status_allocatable{{{label}}}")
+    capacity = _vm_series(f"kube_node_status_capacity{{{label}}}")
+    metrics["allocatable"] = {
+        item["metric"].get("resource"): item.get("value")
+        for item in allocatable
+        if item.get("value") is not None
+    }
+    metrics["capacity"] = {
+        item["metric"].get("resource"): item.get("value")
+        for item in capacity
+        if item.get("value") is not None
+    }
+
+    info = _vm_series(f"kube_node_info{{{label}}}")
+    if info:
+        node_info = {
+            k: v for k, v in info[0]["metric"].items()
+            if k in (
+                "os_image", "kernel_version", "kubelet_version",
+                "container_runtime_version", "internal_ip", "system_uuid",
+            )
+        }
+        metrics["node_info"] = node_info
+
+    return metrics
+
+
+def _collect_node_pod_signals(
+    node_name: str,
+    context: str | None = None,
+    max_pods: int = 6,
+    tail: int = 60,
+):
+    """
+    Walk the pods scheduled on a node and extract per-pod failure signals
+    (state reasons + relevant container log lines). Only degraded or
+    restarted pods are deep-dived to keep the investigation bounded.
+    """
+    usage_result = kubectl.get_node_resource_usage(node_name, context)
+    if not usage_result.get("success"):
+        return {"error": usage_result.get("stderr", "unable to collect node pods")}
+
+    pods = usage_result.get("pods", []) or []
+    degraded = [
+        p for p in pods
+        if p.get("phase") not in ("Running", "Succeeded", "Completed")
+        or (p.get("restarts") or 0) > 0
+    ] or pods
+    degraded = degraded[:max_pods]
+
+    signals = []
+    for pod in degraded[:max_pods]:
+        state_result = kubectl.get_pod_state(pod["namespace"], pod["name"], context)
+        container_states = []
+        reasons = []
+        if state_result.get("success"):
+            for container in (
+                (state_result.get("state") or {}).get("containers") or []
+            ):
+                current = container.get("state") or {}
+                last = container.get("last_state") or {}
+                reason = current.get("reason") or last.get("reason")
+                container_states.append(
+                    {
+                        "container": container.get("name"),
+                        "ready": container.get("ready"),
+                        "restarts": container.get("restart_count"),
+                        "reason": reason,
+                        "exit_code": last.get("exit_code"),
+                        "started_at": current.get("started_at"),
+                    }
+                )
+                if reason:
+                    reasons.append(
+                        f"{container.get('name')}:{reason}"
+                        + (f"(exit {last.get('exit_code')})" if last.get("exit_code") is not None else "")
+                    )
+
+        # Container log signals (current + previous when restarted).
+        log_entries = []
+        fetch_tail = max(5, min(tail, 100))
+        for container in container_states[:2]:
+            current = kubectl.get_pod_logs_container(
+                pod["namespace"], pod["name"], container["container"],
+                tail=fetch_tail, context=context,
+            )
+            if current.get("success"):
+                log_entries.extend(
+                    k8s_log_analysis.extract_relevant_lines(
+                        current.get("stdout", ""),
+                        pod["name"], pod["namespace"],
+                        container["container"], False, max_lines=4,
+                    )
+                )
+            if (container.get("restarts") or 0) > 0:
+                previous = kubectl.get_pod_logs_container(
+                    pod["namespace"], pod["name"], container["container"],
+                    tail=min(fetch_tail, 40), previous=True, context=context,
+                )
+                if previous.get("success"):
+                    log_entries.extend(
+                        k8s_log_analysis.extract_relevant_lines(
+                            previous.get("stdout", ""),
+                            pod["name"], pod["namespace"],
+                            container["container"], True, max_lines=4,
+                        )
+                    )
+
+        signals.append(
+            {
+                "namespace": pod["namespace"],
+                "pod": pod["name"],
+                "phase": pod["phase"],
+                "restarts": pod["restarts"],
+                "state_reasons": reasons,
+                "container_states": container_states[:4],
+                "log_signals": log_entries[: k8s_log_analysis.MAX_RELEVANT_LINES],
+            }
+        )
+
+    return {
+        "node": node_name,
+        "pod_count": len(pods),
+        "restarts_total": usage_result.get("restarts_total", 0),
+        "pods": pods[:40],
+        "deep_dive": signals,
+    }
 
 
 def collect_pod_evidence(
@@ -401,20 +658,25 @@ def collect_pod_evidence(
     # VictoriaMetrics per-pod traffic + latency metrics (kubernetes-pods job)
     evidence["metrics"]["pod"] = _collect_pod_metrics(pod_name)
 
-    # Elasticsearch logs for this pod (ERROR/EXCEPTION/TIMEOUT signals)
+    # Elasticsearch logs for this pod (ERROR/EXCEPTION/TIMEOUT signals).
+    # A healthy-but-quiet pod (0 logs) is reported as CLEAN, not as an
+    # error: silence is a valid signal and must not break the investigation.
     try:
         es_logs = elasticsearch_service.get_pod_logs(
             pod_name, namespace, since_minutes=60, limit=100,
         )
-        if es_logs.get("success") and es_logs.get("total", 0) > 0:
+        if es_logs.get("success") and es_logs.get("available"):
             evidence["elasticsearch"] = {
                 "health": elasticsearch_service.elk_health(),
-                "pod_logs_tail": es_logs.get("stdout", "")[-3000:],
+                "pod_logs_tail": _es_tail(es_logs.get("hits", [])),
                 "log_total": es_logs.get("total", 0),
                 "signal_counts": elasticsearch_service.find_error_patterns(
                     namespace=namespace, since_minutes=60, limit=20,
                 ).get("patterns_found", 0),
             }
+            if not es_logs.get("total", 0):
+                evidence["elasticsearch"]["clean"] = True
+                evidence["elasticsearch"].pop("pod_logs_tail", None)
         else:
             evidence["elasticsearch"] = {
                 "health": elasticsearch_service.elk_health(),
@@ -432,11 +694,218 @@ def collect_pod_evidence(
     try:
         evidence["coredns"] = _collect_coredns_summary(
             {}, context, include_logs=False
-        ).get("coredns", {})
+        )
     except Exception as exc:
         evidence["coredns"] = {"error": str(exc)[:300]}
 
     evidence["git"] = git_correlation.correlate_commits(incident_start=None)
+
+    # Explicit question so the CLI grounds the RCA on pod evidence. Without
+    # it the CLI falls back to a generic "Incident" alert and the model can
+    # not determine a root cause from the collected facts.
+    pod_state = evidence["kubernetes"].get("state") or {}
+    restarts = sum(
+        (c.get("restart_count") or 0)
+        for c in (pod_state.get("containers") or [])
+    )
+    log_signals = (
+        (evidence["kubernetes"].get("log_analysis") or {}).get(
+            "signal_counts", {}
+        )
+        or {}
+    )
+    es = evidence.get("elasticsearch") or {}
+    vm = ((evidence.get("metrics") or {}).get("pod") or {}) or {}
+    evidence["question"] = (
+        f"Investigate Kubernetes pod {pod_name} in namespace {namespace}. "
+        f"State: {pod_state.get('phase', 'unknown')}/"
+        f"{pod_state.get('reason') or 'unknown'} "
+        f"(ready={pod_state.get('ready', 'unknown')}). "
+        f"Container restarts total: {restarts}. "
+        f"Log signals: {log_signals}. "
+        f"ES log total (last 60m): {es.get('log_total', 0) or 0}. "
+        f"Pod metrics: request rate "
+        f"{vm.get('request_rate_rps', 'n/a')} rps, "
+        f"error {vm.get('error_rate_5xx_per_s', 'n/a')} rps "
+        f"({vm.get('error_share_percent', 'n/a')}%), "
+        f"p99 latency {vm.get('p99_latency_seconds', 'n/a')}s. "
+        "Correlate Kubernetes pod state, events and container logs (current "
+        "and previous), VictoriaMetrics pod metrics (request/error rate, "
+        "latency, infra CPU/memory/restarts), Elasticsearch log signals, "
+        "CoreDNS and GitHub evidence. Provide root cause, confidence, "
+        "evidence, timeline, affected component, and remediation."
+    )
+
+    return {
+        "success": True,
+        "evidence": evidence,
+    }
+
+
+def _es_tail(hits, limit: int = 20, max_chars: int = 3000):
+    """Compact log tail built from ES search hits (log lines verbatim)."""
+    lines = []
+    for hit in (hits or [])[:limit]:
+        source = hit.get("_source") or {}
+        line = source.get("log") or source.get("message") or ""
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[-max_chars:]
+
+
+def collect_node_evidence(
+    node_name: str,
+    context: str | None = None,
+    tail: int = 200,
+):
+    """
+    Collect comprehensive, read-only evidence for a Kubernetes node so OpenSRE
+    can root-cause node-level incidents: node state/conditions, describe
+    output, Node events, per-pod failure signals, node-exporter/KSM metrics
+    and Elasticsearch error signals for pods scheduled on the node.
+    """
+    evidence = {
+        "target": {
+            "type": "node",
+            "name": node_name,
+        },
+        "cluster": context,
+        "node": {"name": node_name},
+        "kubernetes": {},
+        "metrics": {"node": {}},
+        "elasticsearch": {},
+        "git": {},
+    }
+
+    # Structured node state (conditions, allocatable, capacity, addresses).
+    state_result = kubectl.get_node_state(node_name, context)
+    if state_result.get("success"):
+        evidence["kubernetes"]["state"] = state_result.get("node")
+    else:
+        evidence["kubernetes"]["state_error"] = (
+            state_result.get("stderr") or "Unable to collect node state"
+        )
+
+    # Raw `kubectl describe node` (taints, kubelet args, per-bucket requests).
+    details_result = kubectl.get_node_details(node_name, context)
+    if details_result.get("success"):
+        evidence["kubernetes"]["node_details"] = details_result.get("stdout", "")
+    else:
+        evidence["kubernetes"]["node_details_error"] = (
+            details_result.get("stderr") or "Unable to collect node details"
+        )
+
+    # Pods scheduled on the node + deep-dive failure signals.
+    signals = _collect_node_pod_signals(node_name, context, tail=tail)
+    evidence["kubernetes"]["node_usage"] = {
+        k: v for k, v in signals.items() if k in (
+            "node", "pod_count", "restarts_total", "pods",
+        )
+    }
+    if signals.get("error"):
+        evidence["kubernetes"]["node_usage_error"] = signals["error"]
+    evidence["kubernetes"]["pod_signals"] = signals.get("deep_dive", [])
+
+    relevant_lines = [
+        entry
+        for pod in signals.get("deep_dive", [])
+        for entry in pod.get("log_signals", [])
+    ][: k8s_log_analysis.MAX_RELEVANT_LINES]
+    evidence["kubernetes"]["log_analysis"] = {
+        "relevant_lines": relevant_lines,
+        "signal_counts": k8s_log_analysis.summarize_signals(relevant_lines),
+    }
+
+    # Node events (raw + structured timeline).
+    events_result = kubectl.get_node_events(node_name, context)
+    if events_result.get("success"):
+        evidence["kubernetes"]["events"] = events_result.get("stdout", "")
+    else:
+        evidence["kubernetes"]["events_error"] = events_result.get(
+            "stderr", "Unable to collect node events"
+        )
+
+    events_json = kubectl.get_node_events_json(node_name, context)
+    node_events = []
+    if events_json.get("success"):
+        node_events = k8s_log_analysis.parse_events(events_json.get("items", []))
+    else:
+        evidence["kubernetes"]["events_structured_error"] = (
+            events_json.get("stderr") or "Unable to collect structured events"
+        )
+    evidence["kubernetes"]["events_structured"] = node_events
+    evidence["kubernetes"]["timeline"] = k8s_log_analysis.build_timeline(
+        relevant_lines, node_events
+    )
+
+    # Node-exporter + KSM metrics.
+    evidence["metrics"]["node"] = _collect_node_metrics(node_name)
+
+    # Elasticsearch error signals for the node's degraded pods (ES has no
+    # node field, so we aggregate per-namespace + per-degraded-pod queries).
+    try:
+        health = elasticsearch_service.elk_health()
+        es_section = {"health": health}
+        if es_section["health"].get("success"):
+            summary = elasticsearch_service.error_summary(since_minutes=60)
+            es_section["error_counts"] = (summary.get("counts") or {}) or {}
+            es_section["errors_total"] = sum(
+                (summary.get("counts") or {}).values()
+            )
+            flagged = []
+            for pod in signals.get("deep_dive", [])[:5]:
+                pod_logs = elasticsearch_service.get_pod_logs(
+                    pod["pod"], pod["namespace"], since_minutes=60, limit=20,
+                )
+                if pod_logs.get("success") and pod_logs.get("available"):
+                    signals_n = elasticsearch_service.find_error_patterns(
+                        namespace=pod["namespace"],
+                        since_minutes=60,
+                        limit=10,
+                    ).get("patterns_found", 0)
+                    flagged.append(
+                        {
+                            "namespace": pod["namespace"],
+                            "pod": pod["pod"],
+                            "log_total": pod_logs.get("total", 0),
+                            "error_signals": signals_n,
+                            "log_tail": _es_tail(pod_logs.get("hits", [])),
+                        }
+                    )
+            es_section["flagged_pods"] = flagged
+        evidence["elasticsearch"] = es_section
+    except Exception as exc:
+        evidence["elasticsearch"] = {
+            "health": elasticsearch_service.elk_health(),
+            "error": str(exc)[:300],
+        }
+
+    evidence["coredns"] = _collect_coredns_summary(
+        {}, context, include_logs=False
+    )
+
+    evidence["git"] = git_correlation.correlate_commits(incident_start=None)
+
+    # Explicit question so the CLI grounds the RCA on node evidence.
+    state = evidence["kubernetes"].get("state") or {}
+    degraded = [
+        p for p in signals.get("deep_dive", [])
+        if p["phase"] not in ("Running", "Succeeded", "Completed")
+    ]
+    evidence["question"] = (
+        f"Investigate Kubernetes node {node_name}. "
+        f"Conditions: {[(c.get('type'), c.get('status')) for c in state.get('conditions', [])]}. "
+        f"Unschedulable: {state.get('unschedulable', False)}. "
+        f"Pod count: {signals.get('pod_count', 0)}, restarts total: "
+        f"{signals.get('restarts_total', 0)}. "
+        f"Degraded pods on node: {len(degraded)} "
+        f"({', '.join(p['pod'] for p in degraded[:6])} ). "
+        "Correlate Kubernetes node state, Node events, node-exporter and "
+        "cAdvisor metrics (CPU/memory/disk/network), pod state and container "
+        "logs, Elasticsearch log signals and GitHub evidence. "
+        "Provide root cause, confidence, evidence, timeline, affected "
+        "component, and remediation."
+    )
 
     return {
         "success": True,
@@ -478,6 +947,32 @@ def _collect_pod_metrics(pod_name: str):
             value = _vm_scalar(f"histogram_quantile({quantile}, {base})")
             if value is not None:
                 metrics[f"{name}_latency_seconds"] = value
+
+    # cAdvisor + kube-state-metrics infra signals (every pod, instrumented or
+    # not): CPU cores / memory working set / restarts. `container!=""`
+    # excludes the pod-sandbox slot so only real app containers count.
+    infra = {
+        "cpu_cores": (
+            f'sum(rate(container_cpu_usage_seconds_total'
+            f'{{pod="{pod_name}", container!=""}}[5m]))'
+        ),
+        "mem_working_set_bytes": (
+            f'sum(container_memory_working_set_bytes'
+            f'{{pod="{pod_name}", container!=""}})'
+        ),
+        "mem_rss_bytes": (
+            f'sum(container_memory_rss_bytes'
+            f'{{pod="{pod_name}", container!=""}})'
+        ),
+        "restarts": (
+            f'sum(kube_pod_container_status_restarts_total'
+            f'{{pod="{pod_name}"}})'
+        ),
+    }
+    for key, query in infra.items():
+        value = _vm_scalar(query)
+        if value is not None:
+            metrics[key] = value
 
     return metrics
 
@@ -799,6 +1294,8 @@ def _collect_coredns_summary(
         evidence["coredns"] = node
     except Exception as exc:
         evidence["coredns"] = {"success": False, "error": str(exc)}
+
+    return evidence["coredns"]
 
 
 def collect_coredns_evidence(
@@ -1496,23 +1993,37 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
             f"p95={pod_metrics.get('p95_latency_seconds')}s",
             f"p99={pod_metrics.get('p99_latency_seconds')}s",
         ]
+        if pod_metrics.get("cpu_cores") is not None:
+            pieces.append(f"cpu={pod_metrics['cpu_cores']} cores")
+        if pod_metrics.get("mem_working_set_bytes") is not None:
+            pieces.append(
+                f"mem={round(pod_metrics['mem_working_set_bytes'] / 1048576, 1)}Mi"
+            )
+        if pod_metrics.get("restarts") is not None:
+            pieces.append(f"restarts={pod_metrics['restarts']}")
         lines.append("pod metrics (last 1m): " + ", ".join(pieces))
 
     # Elasticsearch log signals summary
     es = evidence.get("elasticsearch") or {}
-    if (es.get("health") or {}).get("success") and es.get("signal_counts", 0) > 0:
-        lines.append(
-            f"ES log signals: {es.get('signal_counts')} ERROR/EXCEPTION/TIMEOUT patterns "
-            f"(total logs: {es.get('log_total', 0)})"
-        )
-    if (es.get("health") or {}).get("success") and es.get("error") is None and es.get("pod_logs_tail"):
-        sample_lines = es.get("pod_logs_tail", "").splitlines()
-        error_signals = [l for l in sample_lines if any(
-            tok in l.lower() for tok in ["error", "exception", "timeout", "failed"])]
-        if error_signals:
-            lines.append("notable log entries:")
-            for l in error_signals[:5]:
-                lines.append(f"  - {l[:200]}")
+    if (es.get("health") or {}).get("success"):
+        if es.get("clean"):
+            lines.append(f"ES: healthy and clean — no logs for this pod in the last 60m (log_total={es.get('log_total', 0)})")
+        elif es.get("signal_counts", 0) > 0:
+            lines.append(
+                f"ES log signals: {es.get('signal_counts')} ERROR/EXCEPTION/TIMEOUT patterns "
+                f"(total logs: {es.get('log_total', 0)})"
+            )
+            sample_lines = es.get("pod_logs_tail", "").splitlines()
+            error_signals = [l for l in sample_lines if any(
+                tok in l.lower() for tok in ["error", "exception", "timeout", "failed"])]
+            if error_signals:
+                lines.append("notable log entries:")
+                for l in error_signals[:5]:
+                    lines.append(f"  - {l[:200]}")
+        elif es.get("error") is None:
+            lines.append(
+                f"ES: healthy — {es.get('log_total', 0)} logs in last 60m, no error patterns"
+            )
 
     ns = k8s.get("namespace")
     if isinstance(ns, dict) and ns.get("status_counts"):
@@ -1697,4 +2208,47 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
 
     digest = "\n".join(lines).strip()
     return digest[:max_chars]
+
+
+def pod_alert_payload(evidence: dict, namespace: str, pod_name: str) -> dict:
+    """
+    Build the alert-shaped payload the OpenSRE CLI reads for a pod
+    investigation, with the compact evidence digest folded into
+    `annotations.description`.
+
+    The CLI has no live k8s tool integrations in this deployment (only the
+    knowledge/runbook tool is available), so the agent can only ground its
+    RCA on the input payload. Passing the raw evidence blob produces a
+    generic "Unable to determine root cause"; folding the digest into the
+    description — the same mechanism the alert flow uses — gives the model
+    the concrete pod facts (container last-state, events, log signals, ES
+    error entries, metrics, git correlation) to reason about.
+    """
+    cluster = (evidence.get("cluster") or "") or "kind-opensre-demo"
+    alertname = f"Kubernetes Pod Unhealthy: {pod_name}"
+    alert = {
+        "status": "firing",
+        "alertname": alertname,
+        "startsAt": datetime.now(timezone.utc).isoformat(),
+        "labels": {
+            "alertname": alertname,
+            "severity": "high",
+            "namespace": namespace,
+            "pod": pod_name,
+            "cluster": cluster,
+        },
+        "annotations": {
+            "summary": (
+                f"Kubernetes pod {namespace}/{pod_name} is in an unhealthy "
+                "state (crashes, errors or performance degradation)."
+            ),
+        },
+    }
+    payload = _normalize_alert(alert, _evidence_digest(alert, evidence, evidence.get("git")))
+    payload["question"] = evidence.get("question") or (
+        f"Investigate Kubernetes pod {pod_name} in namespace {namespace}. "
+        "Determine root cause, confidence, evidence, timeline, affected "
+        "component, and remediation from the attached evidence."
+    )
+    return payload
 

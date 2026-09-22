@@ -52,14 +52,15 @@ def onboard():
     )
 
 
-def investigate(alert: dict, source: str = "investigation"):
+def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
     result = run_command(
         [
             settings.OPENSRE_BINARY,
             "investigate",
             "--input-json",
             json.dumps(alert),
-        ]
+        ],
+        timeout=timeout,
     )
     if result.get("returncode") != 0:
         failure = describe_failure(result)
@@ -130,7 +131,7 @@ def describe_failure(result: dict) -> dict:
     }
 
 
-def chat(prompt: dict):
+def chat(prompt: dict, timeout: int = 600):
     context = prompt.get("context", {})
 
     alert = {
@@ -154,5 +155,6 @@ def chat(prompt: dict):
             "investigate",
             "--input-json",
             json.dumps(alert),
-        ]
+        ],
+        timeout=timeout,
     )
