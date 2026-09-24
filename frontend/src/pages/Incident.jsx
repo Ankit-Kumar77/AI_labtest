@@ -301,8 +301,8 @@ export default function Incident() {
 
   const initialLoadRef = useRef({
     clusters: clusters.length,
-    pods: pods.length,
   });
+  const podsLoadedRef = useRef(null);
 
   useEffect(() => {
     if (clusters.length > 0 || initialLoadRef.current.clusters > 0) return;
@@ -358,9 +358,13 @@ export default function Incident() {
 
   useEffect(() => {
     if (!cluster) return;
-    if (initialLoadRef.current.pods > 0 || pods.length > 0) return;
+    // Always refresh from the live cluster on mount / cluster change instead
+    // of trusting the sessionStorage snapshot, which can hold pods that no
+    // longer exist (e.g. deleted debug pods like as-inspect / asd-bisect).
+    if (podsLoadedRef.current === cluster) return;
+    podsLoadedRef.current = cluster;
     loadPods();
-  }, [cluster, pods.length, loadPods]);
+  }, [cluster, loadPods]);
 
   useEffect(() => {
     if (!namespace || !podName) return;

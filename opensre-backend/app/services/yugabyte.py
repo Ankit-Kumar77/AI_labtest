@@ -234,8 +234,14 @@ def connection_status():
 
 
 def slow_queries(limit: int = 20):
-    """Get slow queries from pg_stat_statements if available."""
-    sql = """
+    """Get slow queries from pg_stat_statements.
+
+    Keeps the column names stable by aliasing: newer PostgreSQL exposes
+    `total_exec_time`/`mean_exec_time` while older builds (incl. this
+    YugabyteDB version) only expose `total_time`/`mean_time`. If the modern
+    variant fails, retry with the legacy names aliased back to the same keys.
+    """
+    modern_sql = """
     SELECT
         queryid,
         calls,
@@ -257,7 +263,32 @@ def slow_queries(limit: int = 20):
     ORDER BY mean_exec_time DESC
     LIMIT %s
     """
-    return _execute_with_timeout(sql, params=(limit,), limit=limit)
+    legacy_sql = """
+    SELECT
+        queryid,
+        calls,
+        total_time as total_exec_time,
+        mean_time as mean_exec_time,
+        stddev_time as stddev_exec_time,
+        rows,
+        shared_blks_hit,
+        shared_blks_read,
+        shared_blks_written,
+        local_blks_hit,
+        local_blks_read,
+        local_blks_written,
+        temp_blks_read,
+        temp_blks_written,
+        LEFT(query, 500) as query_preview
+    FROM pg_stat_statements
+    WHERE calls > 0
+    ORDER BY mean_time DESC
+    LIMIT %s
+    """
+    result = _execute_with_timeout(modern_sql, params=(limit,), limit=limit)
+    if result.get("success") or "total_exec_time" not in (result.get("error") or ""):
+        return result
+    return _execute_with_timeout(legacy_sql, params=(limit,), limit=limit)
 
 
 def recent_errors(limit: int = 50):

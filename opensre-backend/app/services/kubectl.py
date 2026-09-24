@@ -504,6 +504,77 @@ def get_node_state(node_name: str, context: str | None = None):
     }
 
 
+def get_node_details(node_name: str, context: str | None = None):
+    """Raw `kubectl describe node` output (conditions, taints, resource usage)."""
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(["describe", "node", node_name])
+    return run_command(command)
+
+
+def get_node_events(
+    node_name: str,
+    context: str | None = None,
+):
+    """Raw `kubectl get events` filtered to the Node object (text form)."""
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(
+        [
+            "get",
+            "events",
+            "--field-selector",
+            f"involvedObject.kind=Node,involvedObject.name={node_name}",
+            "--sort-by=.metadata.creationTimestamp",
+        ]
+    )
+    return run_command(command)
+
+
+def get_node_events_json(
+    node_name: str,
+    context: str | None = None,
+):
+    """
+    Structured Node events (`kubectl get events -o json` filtered to the
+    Node object) for timeline-ready reason/type/timestamp extraction.
+    """
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(
+        [
+            "get",
+            "events",
+            "--field-selector",
+            f"involvedObject.kind=Node,involvedObject.name={node_name}",
+            "--sort-by=.metadata.creationTimestamp",
+            "-o",
+            "json",
+        ]
+    )
+
+    result = run_command(command)
+
+    if not result.get("success"):
+        return result
+
+    try:
+        data = json.loads(result.get("stdout", "{}"))
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "stderr": "unable to parse node events json",
+        }
+
+    return {
+        "success": True,
+        "items": data.get("items", []) or [],
+    }
+
+
 def cordon_node(node_name: str, context: str | None = None):
     command = ["kubectl"]
     if context:
@@ -578,3 +649,99 @@ def get_node_resource_usage(node_name: str, context: str | None = None):
         "restarts_total": restarts_total,
         "pods": pods,
     }
+
+
+def resolve_pod_name(
+    namespace: str,
+    name_or_prefix: str,
+    context: str | None = None,
+):
+    """
+    Resolve a pod name when the caller passes a Deployment/Service/prefix
+    instead of an exact pod name (e.g. "catalog-api" vs "catalog-api-5f7d…").
+    Prefers an exact match, else the most recently started Running pod whose
+    name starts with the given prefix. Returns None on failure.
+    """
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(
+        ["get", "pods", "-n", namespace, "-o", "json"]
+    )
+    result = run_command(command)
+    if not result.get("success"):
+        return None
+    try:
+        items = (json.loads(result.get("stdout", "{}")) or {}).get("items") or []
+    except (TypeError, ValueError):
+        return None
+
+    target = (name_or_prefix or "").lower()
+    if not target:
+        return None
+
+    exact = [p for p in items if (p.get("metadata") or {}).get("name") == target]
+    pool = exact or [
+        p for p in items
+        if (p.get("metadata") or {}).get("name", "").startswith(target)
+    ]
+    if not pool:
+        return None
+
+    def _started_at(p):
+        try:
+            return p["status"]["containerStatuses"][0]["state"]["running"].get("startedAt") or ""
+        except Exception:
+            return ""
+
+    pool.sort(key=lambda p: (p.get("status") or {}).get("phase") != "Running")
+    pool.sort(key=_started_at, reverse=True)
+    if pool:
+        return (pool[0].get("metadata") or {}).get("name")
+    return None
+
+
+def resolve_pod_across_namespaces(
+    name_or_prefix: str,
+    context: str | None = None,
+):
+    """
+    Namespace-agnostic pod resolution. Returns dict {"namespace", "name"} for
+    a Deployment/Service/prefix match, or None. Scans all namespaces when the
+    given prefix isn't found in a single one (caller may have guessed wrong).
+    """
+    command = ["kubectl"]
+    if context:
+        command.extend(["--context", context])
+    command.extend(["get", "pods", "-A", "-o", "json"])
+    result = run_command(command)
+    if not result.get("success"):
+        return None
+    try:
+        items = (json.loads(result.get("stdout", "{}")) or {}).get("items") or []
+    except (TypeError, ValueError):
+        return None
+    target = (name_or_prefix or "").lower()
+    if not target:
+        return None
+    pool = [
+        p for p in items
+        if (p.get("metadata") or {}).get("name", "").startswith(target)
+    ]
+    if not pool:
+        return None
+
+    def _started_at(p):
+        try:
+            return p["status"]["containerStatuses"][0]["state"]["running"].get("startedAt") or ""
+        except Exception:
+            return ""
+
+    pool.sort(key=lambda p: (p.get("status") or {}).get("phase") != "Running")
+    pool.sort(key=_started_at, reverse=True)
+    if pool:
+        return {
+            "namespace": (pool[0].get("metadata") or {}).get("namespace"),
+            "name": (pool[0].get("metadata") or {}).get("name"),
+        }
+    return None

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.services import investigation
 from app.services import opensre_cli
+from app.services import grounding
 from app.services import kubectl
 from app.services import portforward
 from app.services import yugabyte
@@ -322,45 +323,21 @@ def node_investigate(request: NodeRequest):
     node = request.node
     ctx = request.context
 
-    # Collect node state
-    node_state = kubectl.get_node_state(node, ctx)
-    node_usage = kubectl.get_node_resource_usage(node, ctx)
+    # Collect comprehensive node evidence (state, describe, events,
+    # per-pod failure signals, node-exporter/KSM metrics, ES signals).
+    evidence_result = investigation.collect_node_evidence(node, ctx)
 
-    # Get node conditions for evidence summary
-    conditions = []
-    if node_state.get("success"):
-        for c in (node_state.get("node") or {}).get("conditions", []) or []:
-            if c.get("status") != "True":
-                continue
-            conditions.append(f"{c['type']}={c['status']} ({c.get('reason', '')})")
+    if not evidence_result.get("success"):
+        return {
+            "success": False,
+            "node": node,
+            "error": evidence_result.get("error", "Unable to collect node evidence"),
+        }
 
-    # Collect stack-level evidence (includes Kubernetes + VM + Grafana)
-    evidence_result = investigation.collect_stack_evidence(ctx)
+    evidence = evidence_result.get("evidence", {})
 
-    evidence = evidence_result.get("evidence", {}) if evidence_result.get("success") else {}
-
-    # Inject the node problem into evidence for OpenSRE
-    evidence["node_problem"] = {
-        "node": node,
-        "unschedulable": (node_state.get("node") or {}).get("unschedulable", False) if node_state.get("success") else None,
-        "conditions": conditions,
-        "pod_count": node_usage.get("pod_count"),
-        "restarts_total": node_usage.get("restarts_total"),
-        "pods": node_usage.get("pods", []),
-    }
-
-    evidence["target"] = {
-        "type": "node",
-        "name": node,
-    }
-
-    # Build a question for OpenSRE
-    evidence["question"] = (
-        f"The Kubernetes node {node} is reporting as SchedulingDisabled "
-        f"and has {node_usage.get('restarts_total', 0)} pod restarts across "
-        f"{node_usage.get('pod_count', 0)} pods. "
-        f"What is causing this node degradation and what should be done?"
-    )
+    node_state = evidence.get("kubernetes", {}).get("state") or {}
+    node_usage = evidence.get("kubernetes", {}).get("node_usage") or {}
 
     # Run OpenSRE
     opensre_result = opensre_cli.investigate(evidence)
@@ -710,11 +687,14 @@ def db_unavailable_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database appears to be unavailable. "
+        f"CAUSE: The {target.capitalize()} database appears to be unavailable. "
         f"Applications are reporting connection refused errors. "
         f"Investigate the database state and determine the root cause. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)
@@ -851,12 +831,15 @@ def db_latency_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database is experiencing high query latency. "
+        f"CAUSE: The {target.capitalize()} database is experiencing high query latency. "
         f"Applications are timing out or responding slowly. "
         f"Investigate the database for slow queries, resource contention, "
         f"lock waits, or other latency causes. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)
@@ -1180,12 +1163,15 @@ def db_connection_pressure_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database is experiencing connection pressure. "
+        f"CAUSE: The {target.capitalize()} database is experiencing connection pressure. "
         f"Applications are reporting connection timeouts, pool exhaustion, or slow connection acquisition. "
         f"Investigate the database for connection pool saturation, max connections reached, "
         f"idle-in-transaction connections, or other connection-related issues. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)

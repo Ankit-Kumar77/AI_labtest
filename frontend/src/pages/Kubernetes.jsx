@@ -126,6 +126,41 @@ export default function Kubernetes() {
     }
   }
 
+  async function investigateNode(nodeName) {
+    setSelectedPod(`node/${nodeName}`);
+    setInvestigation(null);
+    setInvestigating(true);
+
+    window.sessionStorage.setItem("opensre:node", JSON.stringify(nodeName));
+
+    try {
+      const response = await api.get(
+        `/opensre/investigate/node/${encodeURIComponent(nodeName)}`
+      );
+
+      const data = response.data;
+
+      if (!data.success) {
+        setInvestigation({
+          error: data.stderr || "OpenSRE investigation failed.",
+        });
+      } else {
+        const stdout = stripAnsi(data.stdout || "");
+        const report = extractReport(stdout);
+        setInvestigation({ stdout, report });
+        window.sessionStorage.setItem(
+          "opensre:investigation",
+          JSON.stringify({ stdout, report })
+        );
+      }
+    } catch (err) {
+      console.error(err);
+      setInvestigation({ error: err.message });
+    } finally {
+      setInvestigating(false);
+    }
+  }
+
   // --- Node failure demo handlers ---
   const handleNodeFail = async () => {
     setNodeDemoLoading(true);
@@ -404,6 +439,7 @@ export default function Kubernetes() {
                   <th>Role</th>
                   <th>Version</th>
                   <th>Internal IP</th>
+                  <th></th>
                 </tr>
               </thead>
               <tbody>
@@ -416,6 +452,21 @@ export default function Kubernetes() {
                     <td>{node.role || "—"}</td>
                     <td className="cell-mono cell-muted">{node.version || "—"}</td>
                     <td className="cell-mono cell-muted">{node.ip || "—"}</td>
+                    <td className="cell-right">
+                      <button
+                        type="button"
+                        className="btn btn--ghost btn--sm"
+                        onClick={() => investigateNode(node.name)}
+                        disabled={investigating}
+                      >
+                        {investigating && selectedPod === `node/${node.name}` ? (
+                          <Loader2 size={13} className="btn__spinner" />
+                        ) : (
+                          <Search size={13} />
+                        )}{" "}
+                        Investigate
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>

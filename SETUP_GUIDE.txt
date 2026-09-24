@@ -104,3 +104,24 @@ npm run dev
 
 Then open: http://localhost:5173/logs → namespaces and pods dropdowns should work
 Kibana: http://localhost:5601
+
+## Node AI Analysis + Model Quota Notes
+
+- **AI Analysis page (Target → "Kubernetes node")** and the **Kubernetes
+  page (per-node "Investigate" button)** both run a deep node RCA:
+  `GET /api/opensre/investigate/node/{node_name}` collects node state,
+  `describe node` + raw/structured node events, per-pod failure deep-dive
+  (state reasons + current/previous container logs), node-exporter + KSM
+  metrics, Elasticsearch signals aggregated across degraded pods, CoreDNS and
+  GitHub correlation, then calls the OpenSRE CLI.
+- **ES has no `k8s_node_name` field** — node-level log evidence is aggregated
+  per-namespace/per-degraded-pod, so pods must have ES logs flowing for the
+  `es_signals` block to populate.
+- **In-cluster ES only**: keep `docker-compose.yml` ES (port 9200) DOWN; the
+  backend talks to `opensre-es-master` via
+  `kubectl port-forward -n observability svc/es-external 9200:9200`.
+- **Model quota**: the OpenSRE CLI uses the Gemini free tier
+  (e.g. 20 requests/day per model + per-minute token caps). One investigation
+  runs a multi-step agent loop and can exhaust the daily budget — the UI then
+  shows "investigation failed" even though evidence collection succeeded.
+  Space out investigations or configure a paid provider in the CLI.

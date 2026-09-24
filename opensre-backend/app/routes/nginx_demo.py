@@ -25,33 +25,72 @@ router = APIRouter(prefix="/api/demo/nginx", tags=["Demo - Nginx"])
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 STATE_FILE = PROJECT_ROOT / "chaos" / "experiments" / "nginx_demo_state.json"
 
-# Templates for broken configs (applied via kubectl if cluster exists)
-BROKEN_UPSTREAM = """
-upstream catalog-api {
-    server 127.0.0.1:59999 max_fails=1 fail_timeout=5s;
-}
-server {
-    listen 80;
-    location / {
-        proxy_pass http://catalog-api;
-        proxy_connect_timeout 2s;
-        proxy_read_timeout 3s;
-    }
-}
-"""
+# Templates for broken configs (applied via kubectl if cluster exists).
+# IMPORTANT: injected configs stay VALID nginx configs (events/http wrapper +
+# local /healthz + 8080 health listener) so the pod keeps Running/Ready and
+# the fault is a REAL upstream failure (502 connect refused, 502 dns, 504
+# timeout) instead of a CrashLoopBackOff that hides the true symptom.
+# Only `invalid_config` is intentionally invalid to demo a config-emerg crash.
 
-BROKEN_DNS = """
-upstream catalog-api {
-    server nonexistent-upstream-host.invalid:8000;
-}
-server {
-    listen 80;
-    location / {
-        proxy_pass http://catalog-api;
-        proxy_connect_timeout 2s;
-    }
-}
-"""
+def _broken_nginx_conf(mode: str, dns_resolver: str = "10.96.0.10") -> str:
+    healthz = (
+        "        server {\n"
+        "            listen 80;\n"
+        "            # Readiness/liveness probe gets a LOCAL ok (must not proxy)\n"
+        "            location /healthz {\n"
+        "                access_log off;\n"
+        "                return 200 'ok\\n';\n"
+        "                add_header Content-Type text/plain;\n"
+        "            }\n"
+    )
+    health = (
+        "        server {\n"
+        "            listen 8080;\n"
+        "            location /nginx-health {\n"
+        "                access_log off;\n"
+        "                return 200 'healthy\\n';\n"
+        "            }\n"
+        "        }\n"
+    )
+
+    if mode == "dns":
+        head = "        resolver " + dns_resolver + " valid=5s ipv6=off;\n"
+        proxy = (
+            "            location / {\n"
+            "                set $dead_upstream \"http://nonexistent-upstream-host.invalid:8000\";\n"
+            "                proxy_pass $dead_upstream;\n"
+            "                proxy_set_header Host $host;\n"
+            "                proxy_connect_timeout 2s;\n"
+            "            }\n"
+        )
+    else:  # unavailable + timeout -> dead upstream, connection refused / timeout
+        head = (
+            "        upstream catalog-api {\n"
+            "            server 127.0.0.1:59999 max_fails=1 fail_timeout=5s;\n"
+            "        }\n"
+        )
+        proxy = (
+            "            location / {\n"
+            "                proxy_pass http://catalog-api;\n"
+            "                proxy_set_header Host $host;\n"
+            "                proxy_connect_timeout 2s;\n"
+            "                proxy_read_timeout 3s;\n"
+            "            }\n"
+        )
+
+    return (
+        "worker_processes 1;\n"
+        "error_log /var/log/nginx/error.log warn;\n"
+        "pid /var/run/nginx.pid;\n"
+        "events { worker_connections 256; }\n"
+        "http {\n"
+        + head
+        + healthz
+        + proxy
+        + "        }\n"
+        + health
+        + "}\n"
+    )
 
 class DemoRequest(BaseModel):
     mode: str = "unavailable"  # unavailable | invalid_config | dns | timeout
@@ -115,14 +154,25 @@ def _try_patch_configmap(mode: str, context: str | None):
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         backup_path.write_text(_sanitize_configmap_manifest(get_cm.get("stdout", "")))
 
-    # Build broken nginx.conf patch (minimal)
+    # Build broken nginx.conf patch (valid config, real upstream fault)
+    dns_ip = "10.96.0.10"
+    try:
+        dns_svc = run_command(
+            _kubectl(context)
+            + ["get", "svc", "kube-dns", "-n", "kube-system",
+               "-o", "jsonpath={.spec.clusterIP}"]
+        )
+        if dns_svc.get("success") and dns_svc.get("stdout", "").strip():
+            dns_ip = dns_svc["stdout"].strip()
+    except Exception:
+        pass
     broken_map = {
-        "unavailable": BROKEN_UPSTREAM,
-        "timeout": BROKEN_UPSTREAM,
-        "dns": BROKEN_DNS,
-        "invalid_config": "events {}\nhttp { server { proxypass http://invalid; } }",  # invalid directive
+        "unavailable": _broken_nginx_conf("unavailable"),
+        "timeout": _broken_nginx_conf("timeout"),
+        "dns": _broken_nginx_conf("dns", dns_ip),
+        "invalid_config": "events {}\nhttp { proxypass http://invalid; }",  # invalid directive -> emerg, intentional
     }
-    broken = broken_map.get(mode, BROKEN_UPSTREAM)
+    broken = broken_map.get(mode, broken_map["unavailable"])
 
     # Try to create/patch ConfigMap
     # We create a patch file and apply
@@ -394,7 +444,7 @@ def nginx_modes():
     return {
         "modes": [
             {"id": "unavailable", "name": "Upstream unavailable (connection refused)", "status": "502"},
-            {"id": "timeout", "name": "Upstream timeout (504)", "status": "504"},
+            {"id": "timeout", "name": "Upstream connect timeout (refused)", "status": "502/504"},
             {"id": "dns", "name": "DNS resolution failure (host not found)", "status": "502"},
             {"id": "invalid_config", "name": "Invalid nginx config (emerg)", "status": "500"},
         ]
