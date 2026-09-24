@@ -29,7 +29,7 @@ ELASTICSEARCH_INDEX = getattr(settings, "ELASTICSEARCH_INDEX_PATTERN", "logs-ope
 # Patterns OpenSRE cares about - mapped to Fluent Bit field names
 # Fluent Bit adds k8s_ prefix to kubernetes metadata fields
 PATTERNS = {
-    "ERROR": {"regex": r"\bERROR\b", "severity": "error", "field": "log"},
+    "ERROR": {"regex": r"(?i)error", "severity": "error", "field": "log"},
     "EXCEPTION": {"regex": r"(?i)exception|traceback|trace", "severity": "error", "field": "log"},
     "FAILED": {"regex": r"(?i)failed|failure", "severity": "error", "field": "log"},
     "CONNECTION REFUSED": {"regex": r"(?i)connection refused|connect\(\) failed", "severity": "error", "field": "log"},
@@ -147,13 +147,17 @@ class ElasticsearchConnector:
         namespace: str | None = None,
         limit: int = 30,
     ) -> dict:
-        """Return recent ERROR-level log lines (bounded)."""
+        """Return recent ERROR-level log lines (bounded).
+
+        Fluent Bit does not index a ``level`` field, so the ERROR pattern is
+        matched against the log content instead of a ``level`` term filter.
+        """
         end = datetime.datetime.utcnow().isoformat() + "Z"
         start = (datetime.datetime.utcnow() - datetime.timedelta(minutes=since_minutes)).isoformat() + "Z"
         return self.search_logs(
             start_time=start, end_time=end,
             service=service, namespace=namespace,
-            level="ERROR", pattern=None, limit=limit,
+            pattern=PATTERNS["ERROR"]["regex"], limit=limit,
         )
 
     def get_service_logs(
@@ -188,6 +192,7 @@ class ElasticsearchConnector:
     def find_error_patterns(
         self,
         namespace: str | None = None,
+        pod: str | None = None,
         since_minutes: int = 60,
         limit: int = 20,
     ) -> dict:
@@ -198,7 +203,7 @@ class ElasticsearchConnector:
         for label, cfg in PATTERNS.items():
             res = self.search_logs(
                 start_time=start, end_time=end,
-                namespace=namespace, pattern=cfg["regex"],
+                namespace=namespace, pod=pod, pattern=cfg["regex"],
                 limit=limit,
             )
             if res.get("success") and res.get("available"):

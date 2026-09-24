@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from app.services import investigation
 from app.services import opensre_cli
+from app.services import grounding
 from app.services import kubectl
 from app.services import portforward
 from app.services import yugabyte
@@ -686,11 +687,14 @@ def db_unavailable_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database appears to be unavailable. "
+        f"CAUSE: The {target.capitalize()} database appears to be unavailable. "
         f"Applications are reporting connection refused errors. "
         f"Investigate the database state and determine the root cause. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)
@@ -827,12 +831,15 @@ def db_latency_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database is experiencing high query latency. "
+        f"CAUSE: The {target.capitalize()} database is experiencing high query latency. "
         f"Applications are timing out or responding slowly. "
         f"Investigate the database for slow queries, resource contention, "
         f"lock waits, or other latency causes. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)
@@ -1156,12 +1163,15 @@ def db_connection_pressure_investigate(request: DBScenarioRequest):
 
     evidence = evidence_result["evidence"]
     evidence["question"] = (
-        f"The {target.capitalize()} database is experiencing connection pressure. "
+        f"CAUSE: The {target.capitalize()} database is experiencing connection pressure. "
         f"Applications are reporting connection timeouts, pool exhaustion, or slow connection acquisition. "
         f"Investigate the database for connection pool saturation, max connections reached, "
         f"idle-in-transaction connections, or other connection-related issues. "
         f"Provide: root cause, confidence, evidence, timeline, affected component, "
-        f"and recommended remediation."
+        f"and recommended remediation.\n\n"
+        f"Key signals collected from live evidence (ground truth):\n"
+        f"{grounding.build_context(evidence)['facts']}\n"
+        f"Base the root cause strictly on these signals and the attached evidence."
     )
 
     opensre_result = opensre_cli.investigate(evidence)

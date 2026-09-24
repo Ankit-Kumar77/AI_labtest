@@ -341,8 +341,32 @@ def collect_pod_evidence(
         "metrics": {},
     }
 
-    # Structured pod state (phase, node, container statuses, OOM/BackOff reasons)
+    # Resolve Deployment/Service/prefix names to an exact pod so state,
+    # logs and events are real (a bare "catalog-api" lookup returns nothing
+    # and leaves the guard blind to the pod phase).
     state_result = kubectl.get_pod_state(namespace, pod_name, context)
+    if not (state_result.get("success")
+            and (state_result.get("state") or {}).get("phase")):
+        resolved = kubectl.resolve_pod_name(namespace, pod_name, context)
+        if resolved and resolved != pod_name:
+            pod_name = resolved
+            state_result = kubectl.get_pod_state(namespace, pod_name, context)
+            evidence["pod"]["name"] = resolved
+            evidence["pod"]["namespace"] = namespace
+            evidence["kubernetes"]["resolved_pod"] = resolved
+        elif not resolved:
+            # Name may live in a different namespace (e.g. "catalog-api" is
+            # in "opensre", not "default"): search all namespaces.
+            hit = kubectl.resolve_pod_across_namespaces(pod_name, context)
+            if hit and hit.get("name"):
+                namespace = hit["namespace"]
+                pod_name = hit["name"]
+                evidence["pod"]["namespace"] = namespace
+                evidence["pod"]["name"] = pod_name
+                evidence["kubernetes"]["resolved_pod"] = pod_name
+                state_result = kubectl.get_pod_state(namespace, pod_name, context)
+
+    # Structured pod state (phase, node, container statuses, OOM/BackOff reasons)
 
     if state_result.get("success"):
         evidence["kubernetes"]["state"] = state_result.get("state")
@@ -671,7 +695,8 @@ def collect_pod_evidence(
                 "pod_logs_tail": _es_tail(es_logs.get("hits", [])),
                 "log_total": es_logs.get("total", 0),
                 "signal_counts": elasticsearch_service.find_error_patterns(
-                    namespace=namespace, since_minutes=60, limit=20,
+                    namespace=namespace, pod=pod_name, since_minutes=60,
+                    limit=20,
                 ).get("patterns_found", 0),
             }
             if not es_logs.get("total", 0):
@@ -714,13 +739,17 @@ def collect_pod_evidence(
         )
         or {}
     )
+    ready = (
+        all((c.get("ready") for c in (pod_state.get("containers") or [])))
+        if (pod_state.get("containers") or []) else None
+    )
     es = evidence.get("elasticsearch") or {}
     vm = ((evidence.get("metrics") or {}).get("pod") or {}) or {}
     evidence["question"] = (
         f"Investigate Kubernetes pod {pod_name} in namespace {namespace}. "
         f"State: {pod_state.get('phase', 'unknown')}/"
         f"{pod_state.get('reason') or 'unknown'} "
-        f"(ready={pod_state.get('ready', 'unknown')}). "
+        f"(ready={ready if ready is not None else 'unknown'}). "
         f"Container restarts total: {restarts}. "
         f"Log signals: {log_signals}. "
         f"ES log total (last 60m): {es.get('log_total', 0) or 0}. "
@@ -1517,10 +1546,126 @@ def collect_target_evidence(target: str):
             "Unable to collect container logs",
         )
 
+    # Kubernetes workload state for the target (StatefulSet replicas + recent
+    # events). Without it the model can only see "pod not found" and guesses
+    # between eviction vs. deletion vs. crash — a StatefulSet scaled to 0
+    # (chaos/injection) would be mis-attributed to node/eviction causes.
+    evidence["kubernetes"] = _collect_target_workload_evidence(target)
+
     return {
         "success": True,
         "evidence": evidence,
     }
+
+
+def _collect_target_workload_evidence(target: str) -> dict:
+    """StatefulSet + pod + event state for a chaos target in the databases ns."""
+    sts_name = {
+        "yugabyte": "yugabytedb",
+        "aerospike": "aerospike",
+    }.get(target, target)
+    namespace = "databases"
+    result = {
+        "statefulset": sts_name,
+        "namespace": namespace,
+    }
+    try:
+        sts_result = kubectl.run_command(
+            ["kubectl", "get", "statefulset", sts_name, "-n", namespace, "-o", "json"]
+        )
+        if sts_result.get("success"):
+            try:
+                import json as _json
+                sts = _json.loads(sts_result.get("stdout", ""))
+                spec = sts.get("spec", {})
+                status = sts.get("status", {})
+                selector = (sts.get("spec", {}) or {}).get("selector", {}) or {}
+                result["statefulset_status"] = {
+                    "desired_replicas": spec.get("replicas", 0),
+                    "ready_replicas": status.get("readyReplicas", 0),
+                    "current_replicas": status.get("currentReplicas", 0),
+                    "available_replicas": status.get("availableReplicas", 0),
+                    "observed_generation": status.get("observedGeneration"),
+                    "update_revision": status.get("updateRevision"),
+                }
+                sel_labels = (selector or {}).get("matchLabels", {})
+                if sel_labels:
+                    result["pod_selector_labels"] = sel_labels
+            except Exception:
+                result["statefulset_error"] = "unable to parse statefulset json"
+        else:
+            result["statefulset_error"] = (
+                sts_result.get("stderr") or sts_result.get("error", "")
+            )
+
+        # Pods owned by this StatefulSet (scaled-to-zero means none).
+        pod_result = kubectl.run_command(
+            ["kubectl", "get", "pods", "-n", namespace, "-o", "json"]
+        )
+        managed = []
+        if pod_result.get("success"):
+            try:
+                import json as _json
+                all_pods = (_json.loads(pod_result.get("stdout", "")) or {}).get(
+                    "items", []
+                )
+                for pod in all_pods:
+                    owner_refs = (pod.get("metadata", {}) or {}).get(
+                        "ownerReferences", []
+                    )
+                    is_sts = any(
+                        (o or {}).get("kind") == "StatefulSet"
+                        and (o or {}).get("name") == sts_name
+                        for o in owner_refs
+                    )
+                    st = (pod.get("status", {}) or {}).get("phase", "")
+                    if is_sts:
+                        managed.append({
+                            "name": pod.get("metadata", {}).get("name"),
+                            "phase": st,
+                            "delete_timestamp": (
+                                pod.get("metadata", {}).get("deletionTimestamp")
+                            ),
+                        })
+            except Exception:
+                pass
+        result["statefulset_pods"] = managed
+
+        # Recent events for the StatefulSet/pod explain the scale-down or
+        # termination (e.g. SuccessfulDelete / Scaled down replica set X to 0).
+        events_result = kubectl.run_command(
+            [
+                "kubectl", "get", "events", "-n", namespace,
+                "--sort-by=.lastTimestamp", "-o", "json",
+            ]
+        )
+        relevant = []
+        if events_result.get("success"):
+            try:
+                import json as _json
+                items = (_json.loads(events_result.get("stdout", "")) or {}).get(
+                    "items", []
+                )
+                search = sts_name.lower()
+                for ev in items[-30:]:
+                    src = (ev.get("involvedObject", {}) or {})
+                    name = (src.get("name") or "").lower()
+                    kind = (src.get("kind") or "").lower()
+                    if search in name or kind in ("statefulset", "event"):
+                        relevant.append({
+                            "reason": ev.get("reason"),
+                            "type": ev.get("type"),
+                            "message": ev.get("message"),
+                            "object": f"{src.get('kind')}/{src.get('name')}",
+                            "last_timestamp": ev.get("lastTimestamp"),
+                            "count": ev.get("count"),
+                        })
+            except Exception:
+                pass
+        result["events"] = relevant[-15:]
+    except Exception as exc:
+        result["error"] = str(exc)[:300]
+    return result
 
 
 def collect_workflow_evidence(run_id: int):
@@ -2245,6 +2390,26 @@ def pod_alert_payload(evidence: dict, namespace: str, pod_name: str) -> dict:
         },
     }
     payload = _normalize_alert(alert, _evidence_digest(alert, evidence, evidence.get("git")))
+    # Preserve structured k8s state for the grounding guard (phase/restarts/
+    # lastState exit code). Without this the guard can't tell Running from a
+    # crash and CrashLoopBackOff claims go un-flagged (see aerospike-0:128).
+    k8s = evidence.get("kubernetes") or {}
+    state = k8s.get("state") or {}
+    if isinstance(state, dict):
+        phase = state.get("phase")
+        if not isinstance(phase, str):
+            phase = None
+        payload.setdefault("kubernetes", {})["state"] = {
+            "phase": phase,
+            "name": pod_name,
+            "pod": pod_name,
+        }
+        if isinstance(k8s.get("pods"), list):
+            payload["kubernetes"]["pods"] = k8s["pods"][:40]
+        if isinstance(k8s.get("pod_details"), str):
+            payload["kubernetes"]["pod_details"] = k8s["pod_details"]
+        if isinstance(k8s.get("summary"), dict):
+            payload["kubernetes"]["summary"] = k8s["summary"]
     payload["question"] = evidence.get("question") or (
         f"Investigate Kubernetes pod {pod_name} in namespace {namespace}. "
         "Determine root cause, confidence, evidence, timeline, affected "

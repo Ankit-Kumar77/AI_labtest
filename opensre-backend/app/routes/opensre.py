@@ -134,6 +134,7 @@ def investigate_pod(
         "stderr": cli_result.get("stderr"),
         "returncode": cli_result.get("returncode"),
         "incident_id": cli_result.get("incident_id"),
+        "grounding": cli_result.get("grounding"),
         # VictoriaMetrics pod metrics (request rate, error rate, latency percentiles)
         "vm_metrics": ((evidence_result.get("evidence") or {}).get("metrics") or {}).get("pod", {}),
         # Elasticsearch log signals (ERROR/EXCEPTION/TIMEOUT counts + sample logs)

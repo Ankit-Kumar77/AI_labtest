@@ -41,6 +41,10 @@ spec:
               cpu: "1000m"
               memory: "2Gi"
           volumeMounts:
+            - name: aerospike-config
+              mountPath: /etc/aerospike/aerospike.template.conf
+              subPath: aerospike.conf
+              readOnly: true
             - name: data
               mountPath: /opt/aerospike/data
           readinessProbe:
@@ -64,6 +68,9 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
       volumes:
+        - name: aerospike-config
+          configMap:
+            name: aerospike-config
         - name: data
           emptyDir: {}
 ---
@@ -77,18 +84,24 @@ data:
     service {
         user root
         group root
-        paxos-single-replica-limit 1
         pidfile /var/run/aerospike/asd.pid
         service-threads 4
-        transaction-queues 4
-        transaction-threads-per-queue 4
         proto-fd-max 15000
+        cluster-name aerospike-opensre
     }
     
     network {
         service {
             address any
             port 3000
+            # Backend runs on the host and reaches this pod via `kubectl
+            # port-forward`. Advertise a loopback access-address (with a
+            # non-conflicting access-port) so the client can reconnect to
+            # the forwarded endpoint instead of the unroutable pod IP.
+            # backend .env uses AEROSPIKE_HOSTS=127.0.0.1:3001, and the
+            # setup guide forwards `svc/aerospike 3001:3000`.
+            access-address 127.0.0.1
+            access-port 3001
         }
         
         heartbeat {
@@ -112,11 +125,11 @@ data:
     
     namespace test {
         replication-factor 1
-        memory-size 256M
+        stop-writes-sys-memory-pct 90
+        evict-indexes-memory-pct 0
         default-ttl 30d
-        storage-engine device {
-            file /opt/aerospike/data/test.dat
-            filesize 1G
-            data-in-memory true
+        nsup-period 120
+        storage-engine memory {
+            data-size 1G
         }
     }
