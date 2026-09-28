@@ -1,1282 +1,938 @@
-# 🚀 OpenSRE Dashboard
+# OpenSRE Dashboard
 
-An AI-powered Kubernetes Observability Platform that combines **OpenSRE**, **Kubernetes**, **VictoriaMetrics**, **OpenTelemetry**, and **Grafana** into a single dashboard for monitoring, troubleshooting, and AI-assisted incident analysis.
+An AI-assisted Kubernetes observability platform that unifies metrics, logs, and traces behind a single React console, then layers evidence-grounded root cause analysis on top via the OpenSRE CLI.
 
-The project demonstrates how modern observability tools can be integrated with AI to simplify Kubernetes operations and provide a centralized monitoring experience.
-
----
-
-## ✨ Features
-
-### Infrastructure
-
-- Kubernetes Cluster (Kind)
-- Sample FastAPI Application
-- OpenTelemetry Collector
-- VictoriaMetrics
-- vmagent
-- Grafana
-- Aerospike Database
-- YugabyteDB Database
-- **Elasticsearch & Kibana (ELK Stack for Logs)**
-
-### Backend
-
-- FastAPI REST APIs
-- Kubernetes Integration
-- OpenSRE CLI Integration
-- VictoriaMetrics Health Check
-- Command Execution Layer
-- GitHub Integration (commits, branches, workflows, issues)
-- Aerospike Connector
-- YugabyteDB Connector
-
-### Frontend
-
-- Dashboard
-- Kubernetes Overview
-- Metrics Page
-- Latency Page (live p50/p95/p99, per-pod view, auto-refreshing)
-- AI Analysis
-- GitHub Integration
-- Aerospike Console
-- YugabyteDB Console
-- Settings Page
+The whole stack — Kubernetes, the observability pipeline, and the databases — runs locally in a [Kind](https://kind.sigs.k8s.io/) cluster, so it is reproducible on a laptop and safe to break.
 
 ---
 
-# 🏗 Architecture
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Technology Stack](#technology-stack)
+- [Prerequisites](#prerequisites)
+- [First-Time Setup](#first-time-setup)
+- [Daily Startup](#daily-startup)
+- [Access Points](#access-points)
+- [Project Structure](#project-structure)
+- [Configuration](#configuration)
+- [Chaos Engineering](#chaos-engineering)
+- [API Reference](#api-reference)
+- [Dashboard Pages](#dashboard-pages)
+- [Verification](#verification)
+- [Troubleshooting](#troubleshooting)
+- [Security Notes](#security-notes)
+
+---
+
+## Overview
+
+OpenSRE Demo answers a narrow question well: **what does an AI SRE assistant actually need to see to produce a trustworthy incident report?**
+
+A bare alert payload is not enough. An LLM handed `"target down"` will confidently invent a root cause. So the backend's primary job is **evidence collection** — it queries live cluster state, container exit codes, previous container logs, request/error/latency series, and indexed container logs, then embeds a compact digest into the alert description that the OpenSRE agent reads and cites. If evidence collection fails, the API returns an error rather than a thin, confident report.
+
+On top of that evidence base, OpenSRE produces a structured RCA: root cause, supporting evidence, impact, timeline, recommendation, and a confidence rating.
+
+### What is included
+
+| Layer | Components |
+|---|---|
+| **Cluster** | Kind cluster (control-plane + worker), namespaced workloads, deliberately broken fixtures |
+| **Sample app** | `catalog-api` (FastAPI), `flaky-service`, `nginx`, `traffic-gen` load probe |
+| **Databases** | YugabyteDB (distributed SQL) and Aerospike (NoSQL), both as Kubernetes StatefulSets |
+| **Metrics** | VictoriaMetrics (storage), vmagent (scraping), kube-state-metrics, node-exporter |
+| **Traces** | OpenTelemetry Collector, sidecar-injected into instrumented pods |
+| **Logs** | Fluent Bit (DaemonSet shipper) → Elasticsearch → Kibana |
+| **Visualization** | Grafana, Kibana, and a custom React dashboard |
+| **AI** | OpenSRE CLI agent loop, driven by the FastAPI backend |
+| **Integration** | GitHub API (commits, branches, workflows, issues) for change correlation |
+
+### Deliberately broken workloads
+
+Four pods in the `opensre` namespace are **intentionally unhealthy**. They are the raw material for investigations and are not defects:
+
+| Pod | State | Why it exists |
+|---|---|---|
+| `crashloop` | `CrashLoopBackOff` | Unrecoverable container crash |
+| `memory-hog` | `CrashLoopBackOff` | OOMKilled under memory pressure |
+| `imagepull` | `ImagePullBackOff` | Unresolvable image reference |
+| `pending-pod` | `Pending` | Unsatisfiable scheduling request |
+
+---
+
+## Architecture
 
 ```
-                        +----------------------+
-                        |     React Frontend   |
-                        |     (Dashboard)      |
-                        +----------+-----------+
-                                   |
-                          REST API Calls
-                                   |
-                                   v
-                     +---------------------------+
-                     |     FastAPI Backend       |
-                     |  OpenSRE API Layer        |
-                     +------------+--------------+
-                                  |
-          +-----------------------+-----------------------+
-          |                       |                       |
-          |                       |                       |
-          v                       v                       v
-
-  Kubernetes Cluster      OpenSRE CLI          VictoriaMetrics
-
-          |                                        |
-          |                                        |
-          +-------------------+--------------------+
-                              |
-                              v
-                         OpenTelemetry
-                              |
-                              v
-                           Grafana
+                    Browser
+                       │
+                       ▼
+        ┌──────────────────────────────┐
+        │   React + Vite Dashboard     │
+        │   :5173                      │
+        └──────────────┬───────────────┘
+                       │ REST / JSON
+                       ▼
+        ┌──────────────────────────────┐
+        │   FastAPI Backend  :8001     │
+        │  ──────────────────────────  │
+        │  • evidence collectors       │
+        │  • OpenSRE CLI orchestrator  │
+        │  • data-source connectors    │
+        └──────┬────────┬────────┬─────┘
+               │        │        │
+    ┌──────────▼──┐  ┌──▼─────┐  ├──────────────┐
+    │ Kubernetes  │  │  VM    │  │ Elasticsearch│
+    │  (kubectl)  │  │ 8428   │  │    9200      │
+    └──────────┬──┘  └────────┘  └──────┬───────┘
+               │                        │
+               │                 ┌──────▼───────┐
+               │                 │  Fluent Bit  │
+               │                 │  (DaemonSet) │
+               │                 └──────┬───────┘
+               │                        │
+               ▼                        ▼
+    ┌─────────────────────┐    ┌────────────────────┐
+    │ YugabyteDB  :5433   │    │  VictoriaMetrics   │
+    │ Aerospike   :3001   │    │  + Grafana  :3000  │
+    │ (StatefulSets)      │    │  + Kibana   :5601  │
+    └─────────────────────┘    └────────────────────┘
 ```
 
----
+The backend runs **outside** the cluster on the host, and reaches every in-cluster service through `kubectl port-forward`. This keeps the local development loop simple and makes each dependency independently restartable.
 
-# 🛠 Tech Stack
-
-| Category | Technology |
-|----------|------------|
-| Frontend | React + Vite |
-| Backend | FastAPI |
-| Container Runtime | Podman |
-| Kubernetes | Kind |
-| Metrics | VictoriaMetrics |
-| Metrics Collection | vmagent |
-| Telemetry | OpenTelemetry Collector |
-| Visualization | Grafana |
-| **Log Storage** | **Elasticsearch** |
-| **Log Visualization** | **Kibana** |
-| Log Shipper | Fluent Bit |
-| NoSQL Database | Aerospike |
-| Distributed SQL Database | YugabyteDB |
-| Source Control Integration | GitHub API |
-| AI | OpenSRE |
-| Language | Python 3.13 |
-| Package Manager | pip |
-| API Testing | Bruno |
-| Version Control | Git & GitHub |
-
----
-
-# 📂 Project Structure
+### Request flow for an investigation
 
 ```
-opensre-demo/
-│
-├── catalog-api/
-│
-├── frontend/
-│
-├── opensre-backend/
-│
-├── infra/
-│   ├── kind/
-│   └── k8s/
-│
-├── observability/
-│   ├── install.sh              # Full stack installer (metrics + logs)
-│   ├── vm-values.yaml
-│   ├── vmagent-values.yaml
-│   ├── grafana-values.yaml
-│   ├── otel-values.yaml
-│   ├── es-values.yaml          # Elasticsearch Helm values
-│   └── fluent-bit.yaml         # Fluent Bit DaemonSet
-│
-├── chaos/
-│   ├── runbook.sh
-│   └── README.md
-│
-├── docker-compose.yml          # Local databases + ELK stack
-│
-└── README.md
+Alert payload
+     │
+     ▼
+Target detection ──► infer pod / node / database from alert labels
+     │
+     ▼
+Evidence collection
+  ├─ kubectl: pod state, container reasons, exit codes, events
+  ├─ kubectl: current AND --previous container logs
+  ├─ VictoriaMetrics: request rate, 5xx, p50 / p95 / p99
+  ├─ Elasticsearch: ERROR / EXCEPTION / TIMEOUT signals
+  ├─ CoreDNS health
+  └─ GitHub: recent commits near the incident window
+     │
+     ▼
+Evidence digest embedded into alert description
+     │
+     ▼
+OpenSRE CLI agent loop ──► structured RCA (root cause, evidence, impact,
+                            timeline, recommendation, confidence)
 ```
 
 ---
 
-# ⚙️ Prerequisites
+## Technology Stack
 
-Install the following tools before starting.
+| Category | Technology | Version |
+|---|---|---|
+| Frontend | React, Vite, React Router, Axios | 19.2 / 8.2 / 7.18 |
+| Backend | FastAPI, Uvicorn, Pydantic | 0.141 / 0.52 / 2.13 |
+| Kubernetes client | `kubernetes` Python SDK | 36.0 |
+| Container runtime | Podman (rootless) | 5.7 |
+| Local cluster | Kind | 0.27 |
+| Kubernetes | kubectl | 1.37 |
+| Metrics store | VictoriaMetrics Single | chart 0.45.0 |
+| Metrics scraper | vmagent | chart 0.46.0 |
+| Cluster metrics | kube-state-metrics / node-exporter | chart 8.4.1 / 4.56.3 |
+| Tracing | OpenTelemetry Collector | chart 0.172.0 |
+| Dashboards | Grafana | chart 10.5.15 |
+| Log store | Elasticsearch | chart 8.5.1 |
+| Log UI | Kibana | chart 8.5.1 |
+| Log shipper | Fluent Bit | DaemonSet manifest |
+| Distributed SQL | YugabyteDB | `yugabyte:latest` |
+| NoSQL | Aerospike | 12.0 (Python client) |
+| AI agent | OpenSRE CLI | 0.1.2026.9.1 |
+| Source control | Git, GitHub API | — |
 
-- Ubuntu 24.04/26.04 LTS
-- Python 3.13+
-- Node.js 24+
-- Git
-- Podman
-- Kind
-- kubectl
-- Helm
-- OpenSRE CLI
+---
 
-Verify the installation:
+## Prerequisites
+
+| Tool | Tested version | Purpose |
+|---|---|---|
+| Python | 3.13+ (3.14 verified) | Backend |
+| Node.js | 24+ (26 verified) | Frontend build |
+| Podman or Docker | 5.7+ | Kind node containers |
+| Kind | 0.27+ | Local Kubernetes cluster |
+| kubectl | 1.37+ | Cluster control plane |
+| Helm | 3.16+ | Observability stack |
+| OpenSRE CLI | 0.1.2026.9.1+ | AI investigation agent |
+| Git | any | Version control |
+
+Verify the toolchain:
 
 ```bash
-python3 --version
-node -v
-npm -v
-podman --version
-kubectl version --client
-kind version
-helm version
+python3 --version && node -v && npm -v
+podman --version && kind version
+kubectl version --client && helm version --short
 opensre --version
 ```
-# 🚀 Quick Start
 
-## 1. Clone the Repository
-
-```bash
-git clone https://github.com/<YOUR_USERNAME>/opensre-demo.git
-cd opensre-demo
-```
+> **Rootless Podman works.** The Kind cluster and the full stack have been verified
+> running entirely rootless, so `sudo` is not required if your Podman is configured
+> for rootless operation. Use `sudo` only if your setup requires it.
 
 ---
 
-## 2. Create the Kubernetes Cluster
+## First-Time Setup
+
+Run this sequence once per fresh clone.
+
+### 1. Create the cluster
 
 ```bash
-sudo kind create cluster \
+kind create cluster \
   --name opensre-demo \
   --config infra/kind/kind-config.yaml
 ```
 
-Verify the cluster:
+Verify both nodes reach `Ready`:
 
 ```bash
 kubectl get nodes
 ```
 
-Expected output:
-
 ```
-NAME                         STATUS   ROLES
-opensre-demo-control-plane   Ready    control-plane
-opensre-demo-worker          Ready
+NAME                         STATUS   ROLES           AGE   VERSION
+opensre-demo-control-plane   Ready    control-plane   27d   v1.32.2
+opensre-demo-worker          Ready    <none>          27d   v1.32.2
 ```
 
----
+### 2. Build and load the sample application image
 
-## 3. Build the Sample Application
+Kind nodes have no access to a local registry, so the image must be built and
+explicitly loaded into the cluster.
 
 ```bash
 cd catalog-api
-
-sudo podman build -t localhost/catalog-api:v1 .
-```
-
-Export the image:
-
-```bash
-sudo podman save localhost/catalog-api:v1 -o catalog-api.tar
-```
-
-Load the image into Kind:
-
-```bash
-sudo kind load image-archive catalog-api.tar --name opensre-demo
-```
-
-Remove the archive:
-
-```bash
+podman build -t localhost/catalog-api:v1 .
+podman save localhost/catalog-api:v1 -o catalog-api.tar
+kind load image-archive catalog-api.tar --name opensre-demo
 rm catalog-api.tar
-```
-
----
-
-## 4. Deploy the Application
-
-```bash
 cd ..
-
-kubectl apply -f infra/k8s/
 ```
 
-Verify:
+### 3. Deploy the application and databases
 
 ```bash
-kubectl get all -n opensre
+kubectl apply -f infra/k8s/namespace.yaml
+kubectl apply -f infra/k8s/catalog-api-deployment.yaml
+kubectl apply -f infra/k8s/catalog-api-service.yaml
+kubectl apply -f infra/k8s/nginx-configmap.yaml
+kubectl apply -f infra/k8s/nginx-deployment.yaml
+kubectl apply -f infra/k8s/nginx-service.yaml
+kubectl apply -f infra/k8s/yugabytedb/
+kubectl apply -f infra/k8s/aerospike/
+kubectl apply -f infra/k8s/faults/
 ```
 
-Expected:
+`faults/` installs the intentionally broken workloads described above.
 
-- catalog-api Deployment
-- catalog-api Pod
-- catalog-api Service
+> **Do not run `docker start yugabyte` or `docker start aerospike`.** Those containers
+> are vestigial and deleted. Both databases now run as StatefulSets in the
+> `databases` namespace, and the dashboard reads Kubernetes state — not Docker state.
 
----
-
-# 📊 Deploy Observability Stack
-
-Create the namespace:
+Confirm the databases are up. YugabyteDB takes 2–3 minutes on first start:
 
 ```bash
-kubectl create namespace observability
+kubectl get pods -n databases
 ```
 
-## VictoriaMetrics (install script)
+```
+NAME            READY   STATUS    RESTARTS   AGE
+aerospike-0     1/1     Running   0          2m
+yugabytedb-0    1/1     Running   0          3m
+```
 
-All observability charts are installed idempotently via a single script with
-pinned versions:
+### 4. Deploy the observability stack
+
+A single idempotent script installs and configures everything, with pinned chart
+versions for reproducibility. It is safe to re-run.
 
 ```bash
 ./observability/install.sh
 ```
-
-This creates the **`observability`** namespace, installs the repo charts
-listed below, and applies the custom values files. To reinstall/upgrade,
-run it again — it uses `helm upgrade --install`.
 
 | Chart | Pinned version | Values file |
 |---|---|---|
-| `vm/victoria-metrics-single` | `0.45.0` | `observability/vm-values.yaml` |
-| `vm/victoria-metrics-agent` | `0.46.0` | `observability/vmagent-values.yaml` |
-| `grafana/grafana` | `10.5.15` | `observability/grafana-values.yaml` |
-| `open-telemetry/opentelemetry-collector` | `0.172.0` | `observability/otel-values.yaml` |
-| `prometheus-community/kube-state-metrics` | `8.4.1` | (defaults) |
-| `prometheus-community/prometheus-node-exporter` | `4.56.3` | (defaults) |
-| `elastic/elasticsearch` | `8.5.1` | `observability/es-values.yaml` |
-| `elastic/kibana` | `8.5.1` | (values in install.sh) |
+| `vm/victoria-metrics-single` | 0.45.0 | `observability/vm-values.yaml` |
+| `vm/victoria-metrics-agent` | 0.46.0 | `observability/vmagent-values.yaml` |
+| `grafana/grafana` | 10.5.15 | `observability/grafana-values.yaml` |
+| `open-telemetry/opentelemetry-collector` | 0.172.0 | `observability/otel-values.yaml` |
+| `prometheus-community/kube-state-metrics` | 8.4.1 | defaults |
+| `prometheus-community/prometheus-node-exporter` | 4.56.3 | defaults |
+| `elastic/elasticsearch` | 8.5.1 | `observability/es-values.yaml` |
+| `elastic/kibana` | 8.5.1 | values inline in `install.sh` |
 
-`vm-values.yaml` keeps the single-node VictoriaMetrics at **1-day
-retention** (`retentionPeriod: "1"`), a **16 Gi persistent volume**, and
-resource requests/limits tuned for the demo.
+The script also provisions:
 
-`vmagent-values.yaml` scrapes four jobs: **kube-state-metrics** (pod
-status/restarts), **node** (machine CPU/RAM), **kubernetes-nodes-cadvisor**
-(container CPU/memory/file descriptors) and **kubernetes-pods** (the
-OpenTelemetry-injected `/metrics` endpoint on catalog-api, flaky-service, and
-the traffic-gen probe). The pod-scraper drops the bogus `:80` sidecar target
-(the `.+:\d+$` keep regex on `__address__`), and node/cadvisor relabels use a
-full-match RE2 (`([^:]+):.*`) so the `IP:10250` discovery label is correctly
-stripped.
+- An **ILM policy** for log retention (hot 1d → warm 7d → delete 30d)
+- An **index template** matching `logs-opensre-*`
+- A **Kibana index pattern**, set as the default data view
+- A Grafana datasource for VictoriaMetrics and a pre-provisioned
+  **"Catalog API Overview"** dashboard, embedded live in the Metrics page
 
-To install individually (without the script):
+#### Metrics pipeline
 
-```bash
-helm install victoriametrics vm/victoria-metrics-single -n observability -f observability/vm-values.yaml
-helm install vmagent vm/victoria-metrics-agent -n observability -f observability/vmagent-values.yaml
-```
+`vmagent-values.yaml` configures four scrape jobs:
 
-The Grafana chart is deployed with a VictoriaMetrics datasource and a pre-provisioned **"Catalog API Overview"** dashboard (viewable live inside the Metrics page):
+| Job | Source | Signals |
+|---|---|---|
+| `kubernetes-state` | kube-state-metrics | Pod status, restart counts, waiting reasons |
+| `node` | node-exporter | `node_cpu_seconds_total`, `node_memory_MemAvailable_bytes` |
+| `kubernetes-nodes-cadvisor` | kubelet `/metrics/cadvisor` | Container CPU, memory, file descriptors |
+| `kubernetes-pods` | annotated pods | OpenTelemetry `/metrics` from `catalog-api`, `flaky-service`, `traffic-gen` |
 
-```bash
-helm install grafana grafana/grafana \
-  -n observability \
-  -f observability/grafana-values.yaml
-```
+Two details worth knowing if you extend the config:
 
-The values file exposes Grafana as a `NodePort` on **30300** and maps `localhost:3000` through
-kind (`infra/kind/kind-config.yaml`, `extraPortMappings`), so the embedded Metrics dashboard works
-without a manual port-forward after the cluster is created with the updated config. It also enables
-anonymous Viewer access and iframe embedding so the dashboard charts can be rendered live in the React
-frontend. Login with `admin` / `admin123` for full access.
+- The pod-scraper job keeps only targets matching `.+:\d+$` on `__address__`. This
+  drops the bogus `:80` sidecar targets that multi-container pods produce.
+- Node and cAdvisor relabeling use a **full-match** RE2 (`([^:]+):.*`) to strip the
+  `IP:10250` discovery label before re-targeting `$1:9100` / `$1:10250`. A partial
+  match silently fails here.
 
-If you are running an older cluster (created before the port mapping), reach Grafana with:
+No extra kubelet RBAC is required — the vmagent ClusterRole already grants
+`GET`/`LIST`/`WATCH` on `nodes` and `nodes/metrics`.
 
-```bash
-kubectl port-forward -n observability svc/grafana 3000:80
-```
+#### Single-node caveats
 
----
+This is a demo topology, not a production one:
 
-## ELK Stack (Elasticsearch + Kibana + Fluent Bit)
+- VictoriaMetrics runs with **1-day retention** and a **16 Gi** persistent volume.
+- Elasticsearch is a single node holding all roles, with security disabled
+  (`xpack.security.enabled: false`) and a 1 Gi heap.
+- Elasticsearch and Kibana use anti-affinity `soft`, so both can land on the same node.
 
-The observability stack includes a full ELK stack for log aggregation and visualization. Deploy it using the install script (recommended):
-
-```bash
-./observability/install.sh
-```
-
-This single script installs/upgrades the entire observability stack including:
-- **VictoriaMetrics** (metrics storage)
-- **Grafana** (metrics visualization)
-- **OpenTelemetry Collector** (telemetry collection)
-- **vmagent** (metrics scraping)
-- **Elasticsearch** (log storage) - single-node demo cluster
-- **Kibana** (log visualization) - exposed on NodePort 30001 (mapped to localhost:3001 via Kind)
-- **Fluent Bit** (log shipper) - DaemonSet that tails container logs and ships to Elasticsearch
-
-The install script is idempotent and safe to re-run. It also:
-- Creates an ILM policy for log retention (hot 1d, warm 7d, delete 30d)
-- Creates an index template for `logs-opensre-*` indices
-- Creates a Kibana index pattern and sets it as default
-
-To install ELK components individually:
-
-```bash
-# Elasticsearch
-helm install opensre-es elastic/elasticsearch \
-  -n observability \
-  --version 8.5.1 \
-  -f observability/es-values.yaml
-
-# Kibana (after Elasticsearch is ready)
-helm install opensre-kibana elastic/kibana \
-  -n observability \
-  --version 8.5.1 \
-  --set service.type=NodePort \
-  --set service.nodePort=30001 \
-  --set elasticsearchHosts="http://opensre-es-master:9200" \
-  --no-hooks
-
-# Fluent Bit
-kubectl apply -f observability/fluent-bit.yaml
-```
-
-Access URLs (via Kind port mappings):
-- **Elasticsearch**: http://localhost:9200
-- **Kibana**: http://localhost:3001
-- **Logs Explorer (Frontend)**: http://localhost:5173/logs
-
----
-
-## OpenTelemetry Collector
-
-```bash
-helm install otel-collector open-telemetry/opentelemetry-collector \
-  -n observability \
-  -f observability/otel-values.yaml
-```
-
----
-
-## vmagent (scrape pipeline)
-
-Installed by the install script. The `vmagent-values.yaml` file configures
-the scrape jobs:
-
-- **kube-state-metrics** — pod status, restart counts, waiting reasons
-- **node** — `node_cpu_seconds_total`, `node_memory_MemAvailable_bytes`
-- **kubernetes-nodes-cadvisor** — `container_cpu_usage_seconds_total`,
-  `container_memory_working_set_bytes`, `container_file_descriptors`
-- **kubernetes-pods** — OpenTelemetry `/metrics` endpoint (keeps only
-  annotated targets matching `.+:\d+$` to drop the `:80` sidecar metric
-  noise from multi-container pods)
-
-Node discovery uses `role: node` (`IP:10250`); the relabel regex
-`([^:]+):.*` (full-match) strips the port before re-targeting
-`$1:9100` (node-exporter) or `$1:10250` (cAdvisor). No extra kubelet
-RBAC is needed — the `vmagent-victoria-metrics-agent` ClusterRole already
-has `GET/LIST/WATCH` on `nodes` and `nodes/metrics`.
-
----
-
-Verify all services:
-
-```bash
-kubectl get pods -n observability
-```
-
-Expected:
-
-```
-grafana
-victoriametrics
-otel-collector
-vmagent
-opensre-es-master-0
-opensre-kibana-xxx
-fluent-bit-xxx
-```
-
-All pods should be in the **Running** state.
-
----
-
-# 🔍 Verify Kubernetes
-
-Check all namespaces:
-
-```bash
-kubectl get pods -A
-```
-
-Check application:
-
-```bash
-kubectl get pods -n opensre
-```
-
-Check observability stack:
-
-```bash
-kubectl get pods -n observability
-```
-
-At this point, the Kubernetes cluster, sample application, and observability stack should all be running successfully.
-
-# ▶️ Running the Project
-
-## Start the Backend
-
-Navigate to the backend directory:
+### 5. Set up the backend
 
 ```bash
 cd opensre-backend
-```
-
-Activate the virtual environment:
-
-```bash
+python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # then edit, see Configuration
+cd ..
 ```
 
-Start the FastAPI server:
-
-```bash
-uvicorn app.main:app --reload --port 8001
-```
-
-Backend API:
-
-```
-http://localhost:8001
-```
-
-Swagger Documentation:
-
-```
-http://localhost:8001/docs
-```
-
----
-
-## Start the Frontend
-
-Navigate to the frontend directory:
+### 6. Set up the frontend
 
 ```bash
 cd frontend
-```
-
-Install dependencies:
-
-```bash
 npm install
+cd ..
 ```
 
-Start the development server:
+---
+
+## Daily Startup
+
+The cluster, observability stack, and databases survive between sessions, but
+**port-forwards and the two app servers do not**. Restart them in this order —
+the backend must start *after* the port-forwards, because it caches its
+Elasticsearch client on startup.
+
+### Step 1 — start the cluster
+
+If the Kind nodes are stopped (for example after a reboot):
 
 ```bash
+podman start opensre-demo-control-plane opensre-demo-worker
+kubectl get nodes
+```
+
+Wait for both nodes to report `Ready` before continuing.
+
+### Step 2 — start all port-forwards
+
+Run each in its own terminal — or in one, backgrounded and detached:
+
+```bash
+# One per terminal (simplest)
+kubectl port-forward -n observability svc/es-external 9200:9200
+kubectl port-forward -n observability svc/opensre-kibana-kibana 5601:5601
+kubectl port-forward -n observability svc/victoriametrics-victoria-metrics-single-server 8428:8428
+kubectl port-forward -n observability svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318
+kubectl port-forward -n databases      svc/yugabytedb 5433:5433
+kubectl port-forward -n databases      svc/aerospike 3001:3000
+kubectl port-forward -n observability svc/grafana 3000:80
+```
+
+> **Backgrounding matters.** If you launch these with `&` from a script, wrap each in
+> `setsid`. Plain background jobs are killed when the parent shell exits, which
+> silently breaks every downstream service:
+>
+> ```bash
+> setsid nohup kubectl port-forward -n observability svc/es-external 9200:9200 \
+>   > /tmp/es-pf.log 2>&1 < /dev/null &
+> ```
+
+### Step 3 — start the backend
+
+```bash
+cd opensre-backend
+source .venv/bin/activate
+uvicorn app.main:app --reload --port 8001 --host 0.0.0.0
+```
+
+### Step 4 — start the frontend
+
+```bash
+cd frontend
 npm run dev
 ```
 
-Frontend URL:
+### Stopping
 
-```
-http://localhost:5173
+```bash
+pkill -f "uvicorn app.main:app"
+pkill -f "kubectl port-forward"
+pkill -f "vite"
+
+# Optional: stop the cluster
+podman stop opensre-demo-control-plane opensre-demo-worker
 ```
 
 ---
 
-## Start the Databases (Aerospike, YugabyteDB, Elasticsearch & Kibana)
+## Access Points
 
-### Elasticsearch & Kibana (Local via Docker Compose)
-The backend connects to Elasticsearch for the Logs Explorer. Start them with Docker Compose:
+| Service | URL | Notes |
+|---|---|---|
+| Dashboard | http://localhost:5173 | React app |
+| Backend API | http://localhost:8001 | |
+| Swagger UI | http://localhost:8001/docs | Interactive API reference |
+| Grafana | http://localhost:3000 | `admin` / `admin123` |
+| Kibana | http://localhost:5601 | |
+| Elasticsearch | http://localhost:9200 | No auth |
+| VictoriaMetrics | http://localhost:8428 | |
+| OTel gRPC / HTTP | `localhost:4317` / `localhost:4318` | OTLP ingest |
+| YugabyteDB (YSQL) | localhost:5433 | `yugabyte` / `yugabyte` |
+| Aerospike | localhost:3001 | namespace `test` |
 
-```bash
-docker compose up -d elasticsearch kibana
-```
+### Port conflicts worth knowing
 
-Or with Podman:
-```bash
-podman run -d --name elasticsearch -p 9200:9200 -p 9300:9300 \
-  -e "discovery.type=single-node" -e "xpack.security.enabled=false" \
-  -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
-  -v elasticsearch-data:/usr/share/elasticsearch/data \
-  docker.elastic.co/elasticsearch/elasticsearch:8.15.0
-podman run -d --name kibana -p 5601:5601 \
-  -e "ELASTICSEARCH_HOSTS=http://elasticsearch:9200" \
-  docker.elastic.co/kibana/kibana:8.15.0
-```
+Two port-mapping mechanisms overlap, and only one is reliable:
 
-Elasticsearch on `localhost:9200`, Kibana on `localhost:5601`.
+- **Port-forwards (canonical).** Every service above is reached via
+  `kubectl port-forward`. This works on any cluster and is what the verified
+  setup uses.
+- **Kind `extraPortMappings` (optional).** `infra/kind/kind-config.yaml` maps
+  host `3000 → 30300` (Grafana), `9200 → 30920` (Elasticsearch), and
+  `3001 → 30001` (Kibana). These only take effect on clusters created *with*
+  the current config, and are commonly inactive under rootless Podman.
 
-### YugabyteDB & Aerospike (Running in Kubernetes — NO docker start)
-**Important**: YugabyteDB and Aerospike run as StatefulSets inside the Kind Kubernetes cluster (namespace `databases`). Do NOT use `docker start yugabyte/aerospike` — those containers are deleted and the dashboard no longer reads docker state.
+Two traps follow from this:
 
-Deploy them:
+1. **Kibana on host port 3001 collides with the Aerospike port-forward.** If
+   Aerospike is on 3001, reach Kibana on **5601**.
+2. If host port 9200 is already held by a Kind mapping, the Elasticsearch
+   port-forward cannot bind. Use the Kind mapping or the port-forward, not both.
 
-```bash
-kubectl apply -f infra/k8s/yugabytedb/
-kubectl apply -f infra/k8s/aerospike/
-kubectl get pods -n databases
-# yugabytedb-0 1/1 Running, aerospike-0 1/1 Running
-# (YugabyteDB takes ~2-3 min on first start)
-```
+### In-cluster addresses
 
-This creates:
-- YugabyteDB StatefulSet (1 replica) with services `yugabytedb.databases.svc.cluster.local:5433` (YSQL) and `:9042` (YCQL)
-- Aerospike StatefulSet (1 replica) with service `aerospike.databases.svc.cluster.local:3000`
+Useful for running commands inside a pod:
 
-The backend runs outside the cluster, so it reaches K8s DBs via port-forwards (start before backend):
-
-```bash
-kubectl port-forward -n databases svc/yugabytedb 5433:5433
-kubectl port-forward -n databases svc/aerospike 3001:3000
-```
-
-`.env` is already set for this (`YUGABYTE_HOST=127.0.0.1:5433`, `AEROSPIKE_HOSTS=127.0.0.1:3001`).
-
-To verify database connectivity from the backend:
-```bash
-curl http://localhost:8001/api/yugabyte/health
-curl http://localhost:8001/api/aerospike/health
-```
+| Service | DNS name |
+|---|---|
+| YugabyteDB (YSQL) | `yugabytedb.databases.svc.cluster.local:5433` |
+| YugabyteDB (YCQL) | `yugabytedb.databases.svc.cluster.local:9042` |
+| Aerospike | `aerospike.databases.svc.cluster.local:3000` |
+| Elasticsearch | `opensre-es-master.observability.svc.cluster.local:9200` |
+| VictoriaMetrics | `victoriametrics-victoria-metrics-single-server.observability.svc.cluster.local:8428` |
 
 ---
 
-### Configure GitHub
-
-Copy the integration credentials into `opensre-backend/.env`:
+## Project Structure
 
 ```
-GITHUB_TOKEN=ghp_xxxxx
-GITHUB_REPO=owner/repo-name
+.
+├── catalog-api/              # Sample FastAPI service (OpenTelemetry-instrumented)
+├── fault-apps/               # Flaky-service, traffic-gen probe
+├── opensre-backend/
+│   ├── app/
+│   │   ├── main.py           # FastAPI entrypoint
+│   │   ├── routes/           # HTTP route modules, one per data source
+│   │   ├── services/         # Connectors, evidence collectors, OpenSRE orchestration
+│   │   ├── models/           # Pydantic schemas
+│   │   ├── core/             # Config, logging
+│   │   └── utils/            # Shared helpers
+│   ├── tests/                # pytest suite
+│   └── .env                  # Local config (git-ignored)
+├── frontend/
+│   └── src/
+│       ├── pages/            # 13 routed pages
+│       ├── components/       # Shared UI
+│       ├── api/              # Axios client
+│       └── hooks/
+├── infra/
+│   ├── kind/kind-config.yaml # Cluster topology + port mappings
+│   └── k8s/
+│       ├── yugabytedb/       # StatefulSet + services
+│       ├── aerospike/        # StatefulSet + services
+│       └── faults/           # Deliberately broken workloads
+├── observability/
+│   ├── install.sh            # Idempotent, pinned-version stack installer
+│   ├── es-values.yaml        # Elasticsearch single-node demo config
+│   ├── vm-values.yaml
+│   ├── vmagent-values.yaml
+│   ├── grafana-values.yaml
+│   ├── otel-values.yaml
+│   └── fluent-bit.yaml
+├── chaos/
+│   ├── runbook.sh            # 20+ fault injection scenarios
+│   ├── seed-data.sh
+│   ├── productionize.sh
+│   └── experiments/          # Inject/recover event log (git-ignored)
+├── scripts/
+│   └── investigate-alert.sh  # Terminal-driven RCA, no UI required
+├── docker-compose.yml        # Optional standalone DBs (see below)
+├── SETUP_GUIDE.txt
+└── guide for running
 ```
 
-Create a Personal Access Token at https://github.com/settings/tokens (scope: `repo` for private repos or `public_repo` for public repos).
+### `docker-compose.yml`
 
-Restart the backend after editing `.env`.
+Retained for convenience, but **not part of the default path**. The databases and
+Elasticsearch are meant to run inside the Kind cluster.
+
+Keep any `docker-compose.yml` Elasticsearch **stopped** when the in-cluster
+Elasticsearch port-forward is active — both bind host port 9200 and will conflict.
 
 ---
 
-# 🎭 Chaos Engineering / Failure Demo
+## Configuration
 
-This project ships with a chaos runbook to inject real failures into YugabyteDB,
-Aerospike, and the Kubernetes cluster so they can be observed and analyzed live
-through the OpenSRE dashboard. See [`chaos/README.md`](chaos/README.md) for the
-full guide.
+Backend configuration lives in `opensre-backend/.env`, which is git-ignored. Copy
+from `.env.example` and adjust:
 
-## Database Failure Injection (New!)
+```ini
+# AI agent
+OPENSRE_BINARY=/path/to/opensre
 
-YugabyteDB and Aerospike now run as StatefulSets in Kubernetes. The Chaos Engineering dashboard provides a **Database Failure Injection** section to inject realistic database incidents and investigate them with OpenSRE.
+# Metrics
+VICTORIA_METRICS_URL=http://localhost:8428
+GRAFANA_URL=http://localhost:3000
 
-### Five Database Incident Scenarios
+# Aerospike (host port from the port-forward)
+AEROSPIKE_HOSTS=127.0.0.1:3001
+AEROSPIKE_NAMESPACE=test
 
-| Scenario | Inject Action | Recover Action | Description |
-|----------|--------------|----------------|-------------|
-| **YugabyteDB Unavailable** | `yugabyte-unavailable` | `yugabyte-up` | Scales YugabyteDB StatefulSet to 0 replicas |
-| **YugabyteDB High Latency** | `yugabyte-latency` | `yugabyte-latency-recover` | Induces slow queries via heavy workload |
-| **YugabyteDB Connection Pressure** | `yugabyte-connection-pressure` | `yugabyte-connection-pressure-recover` | Simulates connection pool exhaustion |
-| **Aerospike Unavailable** | `aerospike-unavailable` | `aerospike-up` | Scales Aerospike StatefulSet to 0 replicas |
-| **Aerospike High Latency** | `aerospike-latency` | `aerospike-latency-recover` | Induces slow operations via heavy workload |
+# YugabyteDB (host port from the port-forward)
+YUGABYTE_HOST=127.0.0.1
+YUGABYTE_PORT=5433
+YUGABYTE_DATABASE=yugabyte
+YUGABYTE_USER=yugabyte
+YUGABYTE_PASSWORD=yugabyte
 
-### UI-Driven Workflow (No Terminal Required)
+# GitHub integration
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx
+GITHUB_REPO=owner/repo
+GITHUB_API_URL=https://api.github.com
+```
 
-1. **Open the Chaos page** → `http://localhost:5173/chaos`
-2. **Navigate to "Database Failure Injection"** section
-3. **Click "Inject"** on any scenario (e.g., "YugabyteDB Unavailable")
-4. **Watch the database health flip to "Unreachable"** on the YugabyteDB/Aerospike pages
-5. **Click "Investigate with OpenSRE"** on the database page or Incident page
-6. **OpenSRE automatically gathers evidence** from:
-   - Database (health, connections, slow queries, errors, replication)
-   - Kubernetes (pod state, events, logs)
-   - VictoriaMetrics (metrics, latency, error rates)
-   - Elasticsearch (logs, ERROR/EXCEPTION/TIMEOUT signals)
-   - GitHub (recent commits if relevant)
-7. **OpenSRE correlates evidence** and produces evidence-grounded RCA with:
-   - Root Cause
-   - Supporting Evidence
-   - Impact
-   - Timeline
-   - Recommendation
-   - Confidence (High/Medium/Low)
-8. **Click "Recover"** to restore the database to healthy state
+All defaults point at `127.0.0.1`, because the backend runs on the host and
+reaches in-cluster services through port-forwards.
 
-### CLI Access (Alternative)
+**GitHub token.** Create a [personal access token](https://github.com/settings/tokens)
+with scope `repo` (private repositories) or `public_repo` (public only). The token
+is used for commit/workflow correlation during investigations and is optional —
+GitHub features degrade gracefully without it.
+
+Restart the backend after editing `.env`; values are read at startup.
+
+---
+
+## Chaos Engineering
+
+Fault injection is the core of this project. The platform is only as
+interesting as the incidents you can reproduce on demand.
+
+`chaos/runbook.sh` exposes 20+ scenarios. Inject, watch the signal propagate
+across metrics and logs, run an investigation, then recover.
+
+Run `./chaos/runbook.sh help` for the authoritative, current list. Full guide:
+[`chaos/README.md`](chaos/README.md)
+
+### Database scenarios
+
+Both databases are Kubernetes StatefulSets, so "unavailable" means scaling to
+zero replicas.
+
+| Scenario | Inject | Recover | Effect |
+|---|---|---|---|
+| YugabyteDB unavailable | `yugabyte-down` | `yugabyte-up` | Scales StatefulSet to 0 |
+| YugabyteDB high latency | `yugabyte-latency` | `yugabyte-latency-recover` | Heavy query load |
+| YugabyteDB connection pressure | `yugabyte-connection-pressure` | `yugabyte-connection-pressure-recover` | Exhausts the connection pool |
+| Aerospike unavailable | `aerospike-down` | `aerospike-up` | Scales StatefulSet to 0 |
+| Aerospike high latency | `aerospike-latency` | `aerospike-latency-recover` | Heavy read load |
+
+> **After an unavailable/recover cycle, restart that database's port-forward.**
+> The port-forward process dies together with the pod when the StatefulSet scales
+> to zero, so the backend cannot reconnect until you re-establish it. Then
+> re-check `/api/yugabyte/health` or `/api/aerospike/health`.
+
+### Cluster scenarios
+
+| Group | Scenarios |
+|---|---|
+| **Pod** | `pod-crash`, `pod-delete`, `pod-cpu`, `pod-memory`, `pod-latency` |
+| **Flaky service** | `flaky-latency`, `flaky-latency-off` |
+| **CoreDNS** | `coredns-kill`, `coredns-down`, `coredns-latency`, `coredns-latency-off`, `coredns-up` |
+| **ELK** | `elk-error`, `elk-connection-refused`, `elk-timeout`, `elk-recover` |
+| **Node** | `node-cordon`, `node-drain`, `node-network-latency`, `uncordon` |
+| **System** | `system-pod-kill` |
+| **Utility** | `status`, `recover <target>`, `recover all`, `help` |
 
 ```bash
-# Show current state
 ./chaos/runbook.sh status
-
-# Inject database failures
-./chaos/runbook.sh yugabyte-unavailable      # YugabyteDB unavailable (K8s)
-./chaos/runbook.sh yugabyte-latency          # YugabyteDB high latency
-./chaos/runbook.sh yugabyte-connection-pressure  # YugabyteDB connection pressure
-./chaos/runbook.sh aerospike-unavailable     # Aerospike unavailable (K8s)
-./chaos/runbook.sh aerospike-latency         # Aerospike high latency
-
-# Inject other failures (existing)
+./chaos/runbook.sh yugabyte-down
 ./chaos/runbook.sh pod-crash
-./chaos/runbook.sh pod-cpu
-./chaos/runbook.sh pod-latency
-./chaos/runbook.sh coredns-down
-./chaos/runbook.sh node-network-latency
-# ... etc
-
-# Recover
-./chaos/runbook.sh recover yugabyte-up
-./chaos/runbook.sh recover yugabyte-latency-recover
-./chaos/runbook.sh recover yugabyte-connection-pressure-recover
-./chaos/runbook.sh recover aerospike-up
-./chaos/runbook.sh recover aerospike-latency-recover
 ./chaos/runbook.sh recover all
 ```
 
-### OpenSRE Investigation API
+### Latency injection details
 
-```bash
-# Investigate a database directly
-curl -X POST http://localhost:8001/api/opensre/investigate \
-  -H "Content-Type: application/json" \
-  -d '{"alert_payload": "{\"labels\": {\"alertname\": \"YugabyteDown\", \"database\": \"yugabyte\"}}"}'
+- `pod-latency` / `flaky-latency` call the target's `/failure/latency` control
+  endpoint, injecting a sustained delay into every request (5s catalog, 3s
+  flaky). Override with `POD_LATENCY_MS` / `FLAKY_LATENCY_MS`. Clear with
+  `latency-off` / `flaky-latency-off`.
+- `node-network-latency` applies a `netem` 500ms egress delay on the worker node
+  (`NODE_LATENCY_MS`), which lifts latency for every in-cluster caller. Clear
+  with `network-latency-off`.
 
-# Or use the database investigation endpoint
-curl http://localhost:8001/api/investigation/evidence/target/yugabyte
-curl http://localhost:8001/api/investigation/evidence/target/aerospike
-```
+### UI-driven workflow
 
-> **Latency spike**: `pod-latency` and `flaky-latency` call the target service's
-> `/failure/latency` (or `/latency`) control endpoint, which injects a sustained
-> delay into every request (5s for catalog, 3s for flaky; override with
-> `POD_LATENCY_MS` or `FLAKY_LATENCY_MS`). Watch the **Latency** page focus the
-> affected pod and flag it **HIGH**, then clear it with `latency-off` /
-> `flaky-latency-off`. `node-network-latency` applies a `netem` 500ms egress
-> delay on the worker node (`NODE_LATENCY_MS` to override), which lifts every
-> in-cluster caller's latency; recover with `network-latency-off`.
->
-> **Game-day**: run an automated steady-state experiment from the **Chaos** page
-> (Game-day card) or via the API — baseline → inject → hold ≥ 60s → measure →
-> recover → report, with a degraded/recovered verdict. Every inject/recover
-> writes to `chaos/experiments/events.jsonl`; active faults are tracked in
-> `chaos/experiments/active.json`.
+1. Open http://localhost:5173/chaos
+2. Use **Database Failure Injection** to pick a scenario
+3. Inject, then watch database health flip to **Unreachable** on the database page
+4. Click **Investigate with OpenSRE**
+5. Review the RCA: root cause, evidence, impact, timeline, recommendation, confidence
+6. Recover
 
----
+### Game-day experiments
 
-# 📡 Available API Endpoints
-
-## Health
-
-```
-GET /api/health
-```
-
-Checks whether the backend service is running.
+The **Game-day** card on the Chaos page (or `/api/chaos/game-day`) runs a full
+steady-state experiment: baseline → inject → hold ≥60s → measure → recover →
+report, with a degraded/recovered verdict. Every inject and recover is appended to
+`chaos/experiments/events.jsonl`; active faults are tracked in
+`chaos/experiments/active.json`.
 
 ---
 
-## Kubernetes
+## API Reference
 
-```
-GET /api/kubernetes/nodes
-```
+Interactive documentation is available at http://localhost:8001/docs.
 
-Returns all Kubernetes nodes.
+### Health
 
-```
-GET /api/kubernetes/pods
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/health` | Backend liveness |
+| `GET` | `/api/metrics/health` | VictoriaMetrics reachability |
+| `GET` | `/api/elasticsearch/health` | ES version and cluster status |
+| `GET` | `/api/yugabyte/health` | YugabyteDB connectivity |
+| `GET` | `/api/aerospike/health` | Aerospike connectivity |
+| `GET` | `/api/github/health` | GitHub auth and resolved repository |
 
-Returns all running pods.
+### Kubernetes
 
-```
-GET /api/kubernetes/services
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/kubernetes/nodes` | All nodes |
+| `GET` | `/api/kubernetes/pods` | All pods |
+| `GET` | `/api/kubernetes/services` | All services |
+| `GET` | `/api/kubernetes/deployments` | All deployments |
 
-Returns all Kubernetes services.
+### Logs (Elasticsearch)
 
-```
-GET /api/kubernetes/deployments
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/elasticsearch/facets?since_minutes=60` | Available namespaces, pods, services |
+| `GET` | `/api/elasticsearch/logs` | Query container logs by namespace, pod, level, text |
 
-Returns all deployments.
+The Logs page populates its namespace and pod dropdowns from `/facets`. An empty
+dropdown almost always means the Elasticsearch port-forward is down or was
+started after the backend.
 
----
+### Metrics
 
-## Metrics
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/metrics/latency?window=180&step=30&instance=&pod=` | p50/p95/p99 series (`window` 30–3600s, `step` 5–300s) |
+| `GET` | `/api/metrics/latency/pods` | Latest percentiles and request rate per pod |
 
-```
-GET /api/metrics/health
-```
+`/latency/pods` sets a `high` flag when a pod's p99 exceeds 1s, which drives the
+Latency page per-pod cards, the focus selector, and the alert banner.
 
-Checks VictoriaMetrics connectivity.
+### OpenSRE
 
-```
-GET /api/metrics/latency?window=180&step=30&instance=<name>&pod=<name>
-```
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/opensre/version` | Installed CLI version |
+| `GET` | `/api/opensre/doctor` | Output of `opensre doctor` |
+| `POST` | `/api/opensre/investigate` | Grounded RCA from an alert payload |
+| `GET` | `/api/opensre/investigate/node/{node}` | Node-level RCA with `vm_metrics` and `es_signals` |
+| `POST` | `/api/opensre/chat` | Conversational investigation |
 
-Returns p50 / p95 / p99 request-latency time series over the last `window`
-seconds at `step` intervals (`window` 30–3600s, `step` 5–300s). Used by the
-Latency page, which polls this endpoint every few seconds to keep the charts
-live. Optional `instance` / `pod` query params scope the percentiles to one
-target/pod.
+**Target detection.** Alert labels `pod`, `kubernetes_pod_name`, `namespace`, and
+`kubernetes_namespace_name` select a pod and trigger deep per-pod evidence
+collection. Without a pod, a broader full-stack crash story is attached instead
+(cluster metrics, scrape health, degraded pod counts).
 
-```
-GET /api/metrics/latency/pods
-```
+**Node investigations** collect `kubectl get/describe node`, raw and structured
+node events, every pod on the node with deep-dive on degraded or restarted ones,
+node-exporter and kube-state-metrics figures (load, CPU, memory, filesystem,
+network, page faults, pressure conditions), CoreDNS health, and GitHub
+correlation. Elasticsearch signals are aggregated per degraded pod, because ES
+indexes no `k8s_node_name` field.
 
-Returns the latest p50 / p95 / p99 and request rate **per scraped pod**, with a
-`high` flag when p99 exceeds 1s. Powers the Latency page's per-pod cards, the
-pod **Focus** selector, and the high-latency alert banner.
-
----
-
----
-
-## OpenSRE
-
-```
-GET /api/opensre/version
-```
-
-Returns the installed OpenSRE version.
-
-```
-GET /api/opensre/doctor
-```
-
-Runs `opensre doctor` and returns the diagnostic output.
-
-### Evidence-grounded investigations
-
-The `opensre` CLI has no built-in Kubernetes tooling, so an RCA fed only a bare
-alert produces unverifiable triage ("Non-Validated Claims"). The backend
-collects **live cluster evidence** first (pod state, container reasons/exit
-codes, events, logs incl. `--previous`, per-pod request/5xx/p50-p95-p99 from
-VictoriaMetrics, namespace degraded counts) and embeds a compact digest into the
-alert `description` that the CLI's report reads and cites.
-
-- `POST /api/opensre/investigate` — accepts an alert payload (Grafana/Alertmanager
-  or a bare alert object), auto-attaches evidence, and runs a grounded RCA.
-  Returns an error instead of a thin report if evidence collection fails.
-- `scripts/investigate-alert.sh <alert.json> [kind-context]` — same flow from the
-  terminal (the OpenSRE CLI's own workflow):
+Run the same flow from a terminal with:
 
 ```bash
 ./scripts/investigate-alert.sh /tmp/grafana-alert.json kind-opensre-demo
 ```
 
-Target detection: the alert `labels` `pod` / `kubernetes_pod_name` /
-`namespace` / `kubernetes_namespace_name` pick the pod (deep evidence); without
-a pod, a full-stack crash story (cluster metrics, scrape health, degraded pods)
-is attached instead.
+### Databases
 
-### Node-level investigations
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/yugabyte/query` | Read SQL query |
+| `POST` | `/api/yugabyte/execute` | Arbitrary SQL statement |
+| `POST` | `/api/yugabyte/insert` | Insert and echo a row |
+| `POST` | `/api/yugabyte/update` | Update by `where` clause |
+| `POST` | `/api/yugabyte/delete` | Delete by `where` clause |
+| `GET` | `/api/aerospike/query?namespace=&set=&key=` | Fetch record by key |
+| `POST` | `/api/aerospike/write` | Write record |
+| `POST` | `/api/aerospike/scan` | Scan a set |
+| `POST` | `/api/aerospike/delete` | Delete record |
 
-Node analysis is available from the **AI Analysis** page (Target →
-`Kubernetes node`) and the **Kubernetes** page (an `Investigate` button on every
-node row). Both funnel into one evidence collector
-(`investigation.collect_node_evidence`) covering:
+### GitHub
 
-- `kubectl get node` state (conditions / taints / allocatable),
-  `describe node`, and both raw + structured node events (timeline-ready)
-- every pod scheduled on the node, with deep-dive signals on degraded or
-  restarted pods (state reasons, current + `--previous` container logs)
-- node-exporter + kube-state-metrics numbers: load1/5/15, CPU and memory
-  utilization, largest backing-filesystem usage, network RX/TX and disk rates,
-  major page faults, KSM-reported conditions/pressure, allocatable/capacity
-- Elasticsearch signals aggregated across the node's degraded pods (ES has no
-  `k8s_node_name` field, so per-pod queries are grouped)
-- CoreDNS/DNS health and GitHub commit correlation
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/github/repo` | Repository metadata |
+| `GET` | `/api/github/branches` | List branches |
+| `GET` | `/api/github/commits?sha=&limit=&since=&until=` | Commit history |
+| `GET` | `/api/github/workflows?limit=` | Recent Actions runs |
+| `GET` | `/api/github/issues?state=&limit=` | Repository issues |
 
-Routes: `GET /api/opensre/investigate/node/{node_name}` (RCA + `vm_metrics` +
-`es_signals`), `POST /api/demo/node-failure/investigate`, and the `node` target
-in `POST /api/opensre/chat`.
+### Chaos
 
-> **Model quota note:** the OpenSRE CLI uses the Gemini free tier, which is
-> hard-capped (e.g. 20 requests/day per model plus per-minute token limits). A
-> single investigation runs a multi-step agent loop and can exhaust the daily
-> budget; evidence collection still works and the UI surfaces the 429 as an
-> "investigation failed" report. Space investigations out or switch the CLI to
-> a paid provider for high-volume triage.
-
----
-
-## Aerospike
-
-```
-GET /api/aerospike/health
-```
-
-Checks Aerospike connectivity.
-
-```
-GET /api/aerospike/query?namespace=test&set=users&key=1
-```
-
-Fetches a record by key.
-
-```
-POST /api/aerospike/write
-```
-
-Writes a record.
-
-```
-POST /api/aerospike/scan
-```
-
-Scans all records in a set.
-
-```
-POST /api/aerospike/delete
-```
-
-Deletes a record.
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/chaos/status` | Cluster and database state |
+| `GET` | `/api/chaos/active` | Currently active faults |
+| `GET` | `/api/chaos/history` | Past experiments |
+| `POST` | `/api/chaos/inject` | Inject a named scenario |
+| `POST` | `/api/chaos/recover` | Recover a named scenario |
+| `POST` | `/api/chaos/game-day` | Run a steady-state experiment |
+| `GET` | `/api/demo/db-scenario/list` | Available database scenarios |
+| `POST` | `/api/demo/db-scenario/{unavailable,latency,connection-pressure}/{action}` | Drive a scenario directly |
 
 ---
 
-## YugabyteDB
+## Dashboard Pages
 
-```
-GET /api/yugabyte/health
-```
+| Route | Page | Contents |
+|---|---|---|
+| `/` | Dashboard | Cluster overview: node, pod, service, deployment counts, health summary |
+| `/kubernetes` | Kubernetes | Node and pod inventory, resource usage, per-node **Investigate** action |
+| `/logs` | Logs | Elasticsearch-backed log search with namespace/pod/level filters |
+| `/metrics` | Metrics | VictoriaMetrics health, live embedded Grafana dashboard |
+| `/latency` | Latency | Live p50/p95/p99 tiles, auto-refreshing chart, per-pod cards |
+| `/aerospike` | Aerospike | Connection status, record browser (query/scan/write/delete) |
+| `/yugabyte` | YugabyteDB | Connection status, SQL console (query/execute/insert/update/delete) |
+| `/chaos` | Chaos | Fault injection, database scenarios, game-day experiments |
+| `/incident` | Incident | Investigation list and RCA reports |
+| `/analysis` | AI Analysis | OpenSRE version/doctor output, target picker for pod and node RCA |
+| `/github` | GitHub | Repo overview, branches, commits, workflows, issues |
+| `/settings` | Settings | Component status, quick links to Grafana and Swagger |
 
-Checks YugabyteDB connectivity.
-
-```
-POST /api/yugabyte/query
-```
-
-Runs a read SQL query.
-
-```
-POST /api/yugabyte/execute
-```
-
-Runs any SQL statement.
-
-```
-POST /api/yugabyte/insert
-```
-
-Inserts a row and returns it.
-
-```
-POST /api/yugabyte/update
-```
-
-Updates rows matching a `where` clause.
-
-```
-POST /api/yugabyte/delete
-```
-
-Deletes rows matching a `where` clause.
+The Latency page plots the high-resolution
+`http_request_duration_highr_seconds` histogram, offers 5s/10s/30s refresh with
+pause/resume, and shows **no data** for pods that lack the
+`prometheus.io/scrape: "true"` annotation.
 
 ---
 
-## GitHub
+## Verification
 
-```
-GET /api/github/health
-```
-
-Checks GitHub connectivity and returns the connected repository.
-
-```
-GET /api/github/branches
-```
-
-Lists all repository branches.
-
-```
-GET /api/github/commits?sha=main&limit=50
-```
-
-Lists commits, optionally filtered by branch/SHA and date range (`since`, `until`).
-
-```
-GET /api/github/workflows?limit=20
-```
-
-Lists recent GitHub Actions workflow runs.
-
-```
-GET /api/github/issues?state=open&limit=30
-```
-
-Lists repository issues, filtered by state.
-
-```
-GET /api/github/repo
-```
-
-Returns repository metadata (stars, forks, description, visibility).
-
----
-
-# 🖥 Dashboard Overview
-
-The React dashboard consists of the following pages:
-
-### 📊 Dashboard
-
-- Cluster overview
-- Node count
-- Pod count
-- Service count
-- Deployment count
-- Cluster health summary
-
----
-
-### ☸ Kubernetes
-
-- Node information
-- Pod information
-- Cluster resource overview
-
----
-
-### 📈 Metrics
-
-- VictoriaMetrics health status
-- Grafana integration
-- Live embedded Grafana dashboard (Catalog API Overview) with real-time panels
-
-### ⏱ Latency
-
-- Live P50 / P95 / P99 latency tiles (tail-risk spread = p99 − p50)
-- Auto-refreshing line chart of latency percentiles (5s / 10s / 30s selectable, pause/resume)
-- Plots the high-resolution `http_request_duration_highr_seconds` histogram
-- Per-pod latency cards (each pod's p50/p95/p99 + req/s) with a **HIGH** flag when p99 > 1s
-- Pod **Focus** selector covers every `opensre` namespace pod — pods without the
-  instrumentation scrape (`prometheus.io/scrape: "true"`) show as **no data**
-- High-latency alert banner when any scraped pod's p99 exceeds 1s
-
----
-
-### 🗄 Aerospike
-
-- Connection status
-- Record browser (query / scan / write / delete)
-
----
-
-### 🗄 YugabyteDB
-
-- Connection status
-- SQL console (query / execute / insert / update / delete)
-
----
-
-### 🤖 AI Analysis
-
-- OpenSRE Version
-- OpenSRE Doctor Output
-- Backend integration status
-
----
-
-### 🔗 GitHub
-
-- Repository overview
-- Branch selector
-- Commit history
-- GitHub Actions workflow runs
-- Issues feed
-
----
-
-### ⚙ Settings
-
-- Backend status
-- Kubernetes status
-- VictoriaMetrics status
-- OpenSRE status
-- Quick links to Grafana and Swagger
-
----
-
-# ✅ Verification
-
-Verify that everything is running correctly.
-
-Backend:
+Run these after startup. All should succeed.
 
 ```bash
-curl http://localhost:8001/api/health
-```
-
-Frontend:
-
-Open:
-
-```
-http://localhost:5173
-```
-
-Grafana:
-
-```
-http://localhost:3000
-```
-
-Elasticsearch:
-
-```
-http://localhost:9200
-```
-
-Kibana:
-
-```
-http://localhost:3001
-```
-
-OpenSRE:
-
-```bash
-opensre --version
-```
-
-Kubernetes:
-
-```bash
+# Cluster
 kubectl get nodes
 kubectl get pods -A
+kubectl get pods -n databases
+
+# Backend
+curl -s http://localhost:8001/api/health
+# {"status":"UP","service":"OpenSRE Backend"}
+
+# Databases
+curl -s http://localhost:8001/api/yugabyte/health
+# {"success":true,"status":"connected"}
+curl -s http://localhost:8001/api/aerospike/health
+# {"success":true,"status":"connected"}
+
+# Elasticsearch — expect a green cluster
+curl -s http://localhost:8001/api/elasticsearch/health
+# {"success":true,"available":true,"version":"8.5.1","cluster":"opensre-es"}
+curl -s "http://localhost:8001/api/elasticsearch/facets?since_minutes=60"
+# Expect namespaces and pods arrays to be populated
+
+# Observability stack
+curl -s http://localhost:8428/-/healthy
+# VictoriaMetrics is Healthy.
+curl -s http://localhost:3000/api/health
+curl -s http://localhost:5601/api/status
+
+# Frontend
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost:5173/
+# 200
 ```
 
-If all commands execute successfully and all pods are in the **Running** state, the platform has been deployed successfully.
-
-# 🔧 Troubleshooting
-
-## 1. Kubernetes Cluster Not Reachable
-
-**Error**
-
-```text
-The connection to the server 127.0.0.1:<PORT> was refused
-```
-
-### Solution
-
-If the Kind cluster was recreated using `sudo`, refresh your kubeconfig:
-
-```bash
-mkdir -p ~/.kube
-
-sudo cp /root/.kube/config ~/.kube/config
-
-sudo chown $USER:$USER ~/.kube/config
-
-chmod 600 ~/.kube/config
-```
-
-Verify:
-
-```bash
-kubectl get nodes
-```
+A healthy Logs page shows populated namespace and pod dropdowns. A healthy Chaos
+page lists the database StatefulSets — if it says "local container" instead, the
+backend is reading stale Docker state.
 
 ---
 
-## 2. catalog-api Pod Stuck in `ErrImageNeverPull`
+## Troubleshooting
 
-This happens because the Docker/Podman image hasn't been loaded into the Kind cluster.
+### 1. `connection refused` from kubectl
 
-Rebuild the image:
+The Kind nodes are stopped. If they were created with `sudo`, the kubeconfig may
+have been written to root's home directory.
+
+```bash
+podman start opensre-demo-control-plane opensre-demo-worker
+
+# Only if created with sudo:
+mkdir -p ~/.kube
+sudo cp /root/.kube/config ~/.kube/config
+sudo chown $USER:$USER ~/.kube/config
+chmod 600 ~/.kube/config
+
+kubectl get nodes
+```
+
+### 2. `catalog-api` stuck in `ErrImageNeverPull`
+
+The image was never loaded into the Kind cluster.
 
 ```bash
 cd catalog-api
-
-sudo podman build -t localhost/catalog-api:v1 .
-```
-
-Export the image:
-
-```bash
-sudo podman save localhost/catalog-api:v1 -o catalog-api.tar
-```
-
-Load it into Kind:
-
-```bash
-sudo kind load image-archive catalog-api.tar --name opensre-demo
-```
-
-Restart the deployment:
-
-```bash
+podman build -t localhost/catalog-api:v1 .
+podman save localhost/catalog-api:v1 -o catalog-api.tar
+kind load image-archive catalog-api.tar --name opensre-demo
+rm catalog-api.tar
 kubectl rollout restart deployment/catalog-api -n opensre
+cd ..
 ```
 
----
+### 3. Logs page has empty dropdowns
 
-## 3. OpenTelemetry Collector CrashLoopBackOff
-
-If the collector fails to start, verify the configuration file:
+The Elasticsearch port-forward is down, or the backend started before it and
+cached a broken client. Restart the backend:
 
 ```bash
-observability/otel-values.yaml
+pkill -f "uvicorn app.main:app"
+cd opensre-backend && source .venv/bin/activate
+uvicorn app.main:app --reload --port 8001 --host 0.0.0.0
 ```
 
-Apply the updated configuration:
+### 4. Kibana will not open
+
+Confirm you are not colliding with the Aerospike port-forward on host port 3001.
+Kibana is on **5601**:
+
+```bash
+kubectl port-forward -n observability svc/opensre-kibana-kibana 5601:5601
+```
+
+### 5. Databases show "Unreachable" without a deliberate injection
+
+```bash
+kubectl get pods -n databases          # both should be 1/1 Running
+ss -tlnp | grep -E '5433|3001'         # both port-forwards should be listening
+```
+
+If YugabyteDB is `0/1`, wait 2–3 minutes and check its internal status:
+
+```bash
+kubectl exec -n databases yugabytedb-0 -- bin/yugabyted status
+```
+
+### 6. Database unreachable after an inject/recover cycle
+
+Expected behavior: the port-forward dies with the pod. Re-establish it.
+
+```bash
+kubectl port-forward -n databases svc/yugabytedb 5433:5433
+# or
+kubectl port-forward -n databases svc/aerospike 3001:3000
+```
+
+### 7. Metrics page is empty
+
+```bash
+kubectl get pods -n observability   # vmagent and VictoriaMetrics should be Running
+curl -s http://localhost:8428/-/healthy
+```
+
+### 8. Port-forward dies when the script exits
+
+Background jobs are killed with the parent shell. Use `setsid` — see
+[Daily Startup](#step-2--start-all-port-forwards) for the pattern.
+
+### 9. Investigation returns "investigation failed"
+
+Usually a model quota limit, not an evidence problem. The OpenSRE CLI uses the
+Gemini free tier, which is capped at roughly 20 requests/day per model plus
+per-minute token limits. One investigation runs a multi-step agent loop and can
+exhaust the daily budget on its own.
+
+Verify evidence collection still works independently:
+
+```bash
+curl -s http://localhost:8001/api/opensre/investigate/node/opensre-demo-worker
+```
+
+Space investigations out, or point the CLI at a paid provider for sustained use.
+
+### 10. OpenTelemetry collector in `CrashLoopBackOff`
 
 ```bash
 helm upgrade otel-collector open-telemetry/opentelemetry-collector \
-  -n observability \
-  -f observability/otel-values.yaml
+  -n observability -f observability/otel-values.yaml
 ```
 
 ---
 
-## 4. vmagent Installation Failed
+## Security Notes
 
-Verify the configuration file exists:
+This is a local demo environment. Several deliberate simplifications are **not**
+suitable for production:
 
-```bash
-ls observability/
-```
+- **Elasticsearch and Kibana run with security disabled.** No authentication, no
+  TLS, no network isolation.
+- **Grafana runs with anonymous Viewer access enabled** and default credentials
+  (`admin` / `admin123`).
+- **The database connectors accept arbitrary SQL and ad-hoc queries.** They are
+  not intended to sit behind an untrusted network.
+- **There is no authentication or RBAC on the backend API.** Anyone who can reach
+  port 8001 can inject faults, run queries, and read cluster state.
+- **`.env` holds a GitHub personal access token in plaintext.** It is git-ignored
+  and untracked, but rotate the token if it is ever exposed or committed.
 
-Expected:
-
-```
-otel-values.yaml
-vmagent-values.yaml
-```
-
-Install vmagent again:
-
-```bash
-helm install vmagent vm/victoria-metrics-agent \
-  -n observability \
-  -f observability/vmagent-values.yaml
-```
-
----
-
-## 5. Frontend Cannot Connect to Backend
-
-Verify the backend is running:
-
-```bash
-curl http://localhost:8001/api/health
-```
-
-If not, restart it:
-
-```bash
-cd opensre-backend
-
-source .venv/bin/activate
-
-uvicorn app.main:app --reload --port 8001
-```
-
----
-
-## 6. React Dashboard Shows No Data
-
-Verify Kubernetes:
-
-```bash
-kubectl get nodes
-
-kubectl get pods -A
-```
-
-Verify Backend:
-
-```
-http://localhost:8001/docs
-```
-
-Verify Frontend:
-
-```
-http://localhost:5173
-```
-
----
-
-# 📸 Screenshots
-
-Screenshots of the application will be added after the dashboard UI is finalized.
-
-- Dashboard
-- Kubernetes
-- Metrics
-- AI Analysis
-- Settings
-
----
-
-# 🚀 Future Improvements
-
-- AI-powered incident investigation
-- One-click root cause analysis
-- AlertManager integration
-- Historical incident timeline
-- Dashboard charts and graphs
-- Authentication & RBAC
-- Production deployment on AWS
-
----
-
-# ✅ Current Status
-
-- ✔ Kubernetes Cluster
-- ✔ FastAPI Sample Application
-- ✔ React Dashboard
-- ✔ OpenSRE Backend
-- ✔ VictoriaMetrics
-- ✔ vmagent
-- ✔ OpenTelemetry Collector
-- ✔ Grafana
-- ✔ **Elasticsearch (ELK Stack)**
-- ✔ **Kibana (Log Visualization)**
-- ✔ **Fluent Bit (Log Shipper)**
-- ✔ Kubernetes REST APIs
-- ✔ OpenSRE CLI Integration
-- ✔ Aerospike Connector
-- ✔ YugabyteDB Connector
-- ✔ GitHub Integration
-- ✔ Live Latency Page (p50/p95/p99)
-- ✔ **Logs Explorer with Elasticsearch/Kibana**
-
----
-
-## ⭐ Notes
-
-This project is intended as a local development and learning environment for exploring Kubernetes observability and AI-assisted operations using OpenSRE. It provides a reproducible setup for experimenting with monitoring, telemetry collection, and dashboard development before deploying to a production environment.
+Before adapting this stack beyond a laptop: enable ES/Kibana security, replace
+default Grafana credentials, add authentication to the FastAPI backend, and
+restrict the database connectors to a read-only role.
