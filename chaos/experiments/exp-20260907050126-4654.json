@@ -1,0 +1,47 @@
+{
+  "id": "exp-20260907050126-4654",
+  "kind": "game-day",
+  "fault": "flaky-latency",
+  "recover_action": "flaky-latency-off",
+  "started": "2026-09-07T05:01:26Z",
+  "duration_s": 60,
+  "baseline": {
+    "req_s": 0.95,
+    "5xx_s": 0.21666666666666667,
+    "5xx_pct": 22.81,
+    "p50_s": 0.008142857142857143,
+    "p95_s": 8.21875,
+    "p99_s": 9.64375,
+    "targets_up": 1.0
+  },
+  "during": {
+    "req_s": 0.8499999999999999,
+    "5xx_s": 0.06666666666666667,
+    "5xx_pct": 7.84,
+    "p50_s": 0.0875,
+    "p95_s": 9.785714285714285,
+    "p99_s": 24.79999999999997,
+    "targets_up": 1.0
+  },
+  "after": {
+    "req_s": 1.0333333333333332,
+    "5xx_s": 0.11666666666666667,
+    "5xx_pct": 11.29,
+    "p50_s": 0.025,
+    "p95_s": 8.450000000000001,
+    "p99_s": 9.690000000000001,
+    "targets_up": 1.0
+  },
+  "verdict": {
+    "degraded": false,
+    "recovered": true,
+    "baseline_p99_s": 9.64375,
+    "during_p99_s": 24.79999999999997,
+    "after_p99_s": 9.690000000000001,
+    "threshold_s": 28.931
+  },
+  "injection": {
+    "success": true,
+    "stdout": " on pod 'flaky-service-5f76dfddb5-lbft8'\u001b[0m\n\u001b[32m  \u2713 {\"status\":\"latency updated\",\"delay_ms\":3000}\u001b[0m\n\n  >>> traffic-gen keeps hitting /orders + /slow, so flaky-service\n      p50/p95/p99 should climb toward 3000ms on the Latency page.\n\n  >>> Then run './chaos/runbook.sh recover flaky-latency-off'.\n"
+  }
+}

@@ -1,0 +1,18 @@
+apiVersion: v1
+data:
+  nginx.conf: "worker_processes 1;\nerror_log /var/log/nginx/error.log warn;\npid\
+    \ /var/run/nginx.pid;\nevents { worker_connections 256; }\nhttp {\n        resolver\
+    \ 10.96.0.10 valid=5s ipv6=off;\n        server {\n            listen 80;\n  \
+    \          # Readiness/liveness probe gets a LOCAL ok (must not proxy)\n     \
+    \       location /healthz {\n                access_log off;\n               \
+    \ return 200 'ok\\n';\n                add_header Content-Type text/plain;\n \
+    \           }\n            location / {\n                set $dead_upstream \"\
+    http://nonexistent-upstream-host.invalid:8000\";\n                proxy_pass $dead_upstream;\n\
+    \                proxy_set_header Host $host;\n                proxy_connect_timeout\
+    \ 2s;\n            }\n        }\n        server {\n            listen 8080;\n\
+    \            location /nginx-health {\n                access_log off;\n     \
+    \           return 200 'healthy\\n';\n            }\n        }\n}\n"
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: opensre

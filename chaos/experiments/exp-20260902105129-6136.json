@@ -1,0 +1,47 @@
+{
+  "id": "exp-20260902105129-6136",
+  "kind": "game-day",
+  "fault": "pod-latency",
+  "recover_action": "latency-off",
+  "started": "2026-09-02T10:51:29Z",
+  "duration_s": 60,
+  "baseline": {
+    "req_s": 0.8333333333333335,
+    "5xx_s": null,
+    "5xx_pct": null,
+    "p50_s": 0.005,
+    "p95_s": 0.0095,
+    "p99_s": 0.0099,
+    "targets_up": 1.0
+  },
+  "during": {
+    "req_s": 0.6333333333333334,
+    "5xx_s": null,
+    "5xx_pct": null,
+    "p50_s": 0.005277777777777778,
+    "p95_s": 5.124999999999995,
+    "p99_s": 7.025000000000002,
+    "targets_up": 1.0
+  },
+  "after": {
+    "req_s": 0.6333333333333334,
+    "5xx_s": null,
+    "5xx_pct": null,
+    "p50_s": 0.005588235294117647,
+    "p95_s": 6.312499999999997,
+    "p99_s": 7.262500000000001,
+    "targets_up": 1.0
+  },
+  "verdict": {
+    "degraded": true,
+    "recovered": false,
+    "baseline_p99_s": 0.0099,
+    "during_p99_s": 7.025000000000002,
+    "after_p99_s": 7.262500000000001,
+    "threshold_s": 0.15
+  },
+  "injection": {
+    "success": true,
+    "stdout": "tency updated\",\"delay_ms\":5000}\u001b[0m\n\n  >>> Traffic-gen hits catalog-api /products constantly, so the Latency\n      page should show catalog-api p50/p95/p99 climbing toward 5000ms,\n      and the per-pod cards will flag it as HIGH.\n\n  >>> Then run './chaos/runbook.sh recover latency-off' to clear it.\n"
+  }
+}
