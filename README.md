@@ -1044,10 +1044,40 @@ The alert API returns a specific `error` and `hint` for provider failures:
 | `exceed your available credits given your current in-flight requests` | Free-tier concurrency limit | Already retried with backoff and serialised automatically |
 
 OpenSRE asks for a **fixed 4096 output tokens** per call and that value is not
-configurable. If a key can only afford fewer than 4096 tokens per request it will
-fail every investigation regardless of how much credit it holds; the fix is to
-raise the key's limit (OpenRouter: Settings → API keys → edit the key's limit)
-or switch `LLM_PROVIDER`.
+configurable — `config set max_tokens` and the usual base-URL env vars are all
+ignored. So on a provider that cannot afford one full request, every
+investigation fails with:
+
+```
+HTTP 402 - "You requested up to 4096 tokens, but can only afford 3540."
+```
+
+That is a **per-request ceiling, not a depleted balance**, and it is not fixable
+from this repo: the real fix is to raise the key's total limit at the provider.
+
+### The token-ceiling shim
+
+Until the key is funded, the backend pod runs an `llm-ceiling-proxy` sidecar
+(`opensre-backend/app/services/llm_ceiling_proxy.py`). The CLI talks OpenAI
+protocol to `http://127.0.0.1:8900/v1` through its `custom-openai` provider, and
+the shim forwards to the real provider with the real key, clamping
+`max_tokens`:
+
+- **Self-tuning**: on a `can only afford N` rejection it lowers the cap to
+  `N - 64` and replays the call once.
+- **Waits out in-flight 402s**: the free tier also rejects overlapping requests,
+  which clears on its own, so it backs off instead of failing the run.
+- **IPv4-only**: a provider hostname that returns an AAAA record fails with
+  `ENETUNREACH` on a Kind cluster (no IPv6 route) roughly every other request.
+  The shim drops IPv6 candidates.
+- **Degrades to a pass-through**: if the key is funded the cap simply rises, and
+  the sidecar plus the three `CUSTOM_OPENAI_*` keys can be deleted with
+  `LLM_PROVIDER=openrouter`.
+
+It has a floor, though: a free tier that affords only a few hundred tokens per
+call cannot sustain a multi-step agent loop. The shim makes the RCA step work
+with a *small* budget, not a zero one. Add credits or raise the key's limit for
+reliable RCA.
 
 Verify evidence collection still works independently:
 

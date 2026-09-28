@@ -328,6 +328,17 @@ def _llm_env():
             "OPENROUTER_API_KEY": settings.OPENROUTER_API_KEY,
             "OPENROUTER_MODEL": settings.OPENROUTER_MODEL,
         }
+    if provider == "custom-openai":
+        # Used with the in-pod token-ceiling shim: the CLI keeps talking
+        # OpenAI protocol to a local address, and the shim forwards to the
+        # real provider. The key here is a placeholder; the shim holds the
+        # real credential and never exposes it to the CLI.
+        return {
+            "LLM_PROVIDER": provider,
+            "CUSTOM_OPENAI_API_KEY": settings.CUSTOM_OPENAI_API_KEY or "via-shim",
+            "CUSTOM_OPENAI_BASE_URL": settings.CUSTOM_OPENAI_BASE_URL,
+            "CUSTOM_OPENAI_MODEL": settings.CUSTOM_OPENAI_MODEL,
+        }
     if provider == "gemini":
         return {"LLM_PROVIDER": provider, "GEMINI_API_KEY": settings.GEMINI_API_KEY}
     return {"LLM_PROVIDER": provider} if provider else {}

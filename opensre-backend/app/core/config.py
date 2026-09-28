@@ -22,6 +22,14 @@ class Settings:
     OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+    # OpenAI-compatible endpoint, used with LLM_PROVIDER=custom-openai to route
+    # the CLI through the in-pod token-ceiling shim
+    # (app/services/llm_ceiling_proxy.py). The shim holds the real provider key;
+    # CUSTOM_OPENAI_API_KEY only has to be non-empty.
+    CUSTOM_OPENAI_API_KEY = os.getenv("CUSTOM_OPENAI_API_KEY", "")
+    CUSTOM_OPENAI_BASE_URL = os.getenv("CUSTOM_OPENAI_BASE_URL", "")
+    CUSTOM_OPENAI_MODEL = os.getenv("CUSTOM_OPENAI_MODEL", "gpt-4o-mini")
+
     VICTORIA_METRICS_URL = os.getenv(
         "VICTORIA_METRICS_URL",
         "http://localhost:8428",

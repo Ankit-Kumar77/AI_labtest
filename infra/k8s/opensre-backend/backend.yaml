@@ -69,8 +69,17 @@ data:
   # because the Gemini free tier (~20 requests/day) cannot sustain an
   # alert-driven pipeline. The API key comes from the Secret; only the
   # non-secret provider + model live here.
-  LLM_PROVIDER: openrouter
+  LLM_PROVIDER: custom-openai
   OPENROUTER_MODEL: openai/gpt-4o-mini
+  # The CLI talks OpenAI protocol to the llm-ceiling-proxy sidecar, which
+  # forwards to OPENROUTER_UPSTREAM with the real key. The shim exists because
+  # the CLI hardcodes a 4096-token request it cannot be told to lower.
+  # To talk to OpenRouter directly instead, set:
+  #   LLM_PROVIDER=openrouter  and drop the sidecar + these three keys.
+  CUSTOM_OPENAI_BASE_URL: http://127.0.0.1:8900/v1
+  CUSTOM_OPENAI_MODEL: gpt-4o-mini
+  # Placeholder only: the shim holds the real credential.
+  CUSTOM_OPENAI_API_KEY: via-shim
   # Investigations run one at a time. The OpenRouter free tier rejects
   # overlapping in-flight requests (HTTP 402), and a burst of simultaneous
   # firing alerts used to guarantee that failure. Raise only if the provider
@@ -177,6 +186,47 @@ spec:
               memory: 256Mi
             limits:
               memory: 1Gi
+
+        # Token-ceiling shim. The OpenSRE CLI hardcodes a 4096 output-token
+        # request and exposes no way to change it, so a provider that cannot
+        # afford one full request fails every investigation with HTTP 402
+        # ("can only afford N"). This sidecar sits in the same pod network
+        # namespace and caps max_tokens at an affordable value, forwarding to
+        # the real provider with the real key.
+        #
+        # The cap is self-tuning (it lowers on a ceiling rejection and rises
+        # back as soon as the key is funded), so this degrades to a pass-through
+        # and can be deleted once the key's limit is raised. The backend uses
+        # LLM_PROVIDER=custom-openai to reach it.
+        - name: llm-ceiling-proxy
+          image: localhost/opensre-backend:alert
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "app.services.llm_ceiling_proxy"]
+          env:
+            - name: LLM_CEILING_PROXY_PORT
+              value: "8900"
+            - name: LLM_CEILING_PROXY_UPSTREAM
+              value: "https://openrouter.ai/api/v1"
+            - name: LLM_CEILING_PROXY_MODEL
+              value: "openai/gpt-4o-mini"
+            # Starting cap. 1024 matches what the free tier currently
+            # affords, so an investigation does not burn a call discovering
+            # the ceiling. The shim lowers this further on rejection; raise it
+            # (or remove the sidecar) once the key's limit is funded.
+            - name: LLM_CEILING_PROXY_MAX_TOKENS
+              value: "1024"
+            - name: LLM_CEILING_PROXY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: OPENROUTER_API_KEY
+                  optional: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
       volumes:
         # Alert + incident histories are file-backed. emptyDir would lose
         # every incident on pod replacement, so back them with a PVC.
