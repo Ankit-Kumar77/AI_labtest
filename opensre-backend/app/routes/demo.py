@@ -76,24 +76,6 @@ def _seed_aerospike():
     return {"success": True, "inserted": inserted}
 
 
-def _stop_container(name: str):
-    result = run_command(["docker", "stop", name])
-    return {
-        "success": result.get("success", False),
-        "stdout": result.get("stdout", ""),
-        "stderr": result.get("stderr", ""),
-    }
-
-
-def _start_container(name: str):
-    result = run_command(["docker", "start", name])
-    return {
-        "success": result.get("success", False),
-        "stdout": result.get("stdout", ""),
-        "stderr": result.get("stderr", ""),
-    }
-
-
 # Databases run as Kubernetes StatefulSets (namespace/databases), not docker
 # containers. Scale the StatefulSet to 0/1 for unavailable/recover scenarios.
 DB_STATEFULSETS = {
@@ -885,6 +867,77 @@ def db_latency_recover(request: DBScenarioRequest):
 # ------------------------------------------------------------------
 # SCENARIO 3: Data Quality / Data Integrity Problem
 # ------------------------------------------------------------------
+@router.post("/db-scenario/data-integrity/purge")
+def db_data_integrity_purge(request: DBScenarioRequest):
+    """Remove the data-integrity test data so the database reads clean again.
+
+    The data-integrity scenarios (corrupt / insert-empty / insert-duplicates /
+    insert-invalid) write into dedicated test sets/tables. There was no
+    counterpart to undo them, so a corrupted database stayed permanently
+    unhealthy and the inject -> observe -> recover cycle could not complete.
+    """
+    target = request.target.lower()
+
+    if target not in ("yugabyte", "aerospike"):
+        raise HTTPException(status_code=400, detail=f"Unknown target '{target}'")
+
+    if target == "yugabyte":
+        rows = yugabyte.execute_raw("DROP TABLE IF EXISTS integrity_test")
+        return {
+            "success": True,
+            "scenario": "data-integrity-purge",
+            "target": target,
+            "details": "Dropped table integrity_test",
+            "rows": rows,
+        }
+
+    # Aerospike has no TRUNCATE, so delete every record in the test sets.
+    removed = 0
+    errors = []
+    for set_name in ("integrity", "latency"):
+        try:
+            client = aerospike.get_client()
+        except Exception as exc:
+            errors.append(f"connect: {exc}")
+            continue
+        keys = []
+
+        def collect(record, _keys=keys):
+            # The scenarios stamp a logical key into the `_key` bin, and that
+            # is the only value the server will remove by: the key tuple's
+            # user-key slot holds a 20-byte hashed value that answers
+            # RECORD_NOT_FOUND. Prefer the bin, fall back to the tuple.
+            key = (record[2] or {}).get("_key")
+            if key is None:
+                key_tuple = record[0]
+                key = key_tuple[3] if len(key_tuple) > 3 else key_tuple[2]
+            if key is not None:
+                _keys.append(key)
+
+        try:
+            client.scan("test", set_name).foreach(collect)
+        except Exception as exc:
+            errors.append(f"scan {set_name}: {exc}")
+            client.close()
+            continue
+        for key in keys:
+            try:
+                client.remove(("test", set_name, key))
+                removed += 1
+            except Exception as exc:
+                errors.append(f"{set_name}: {exc}")
+        client.close()
+
+    return {
+        "success": True,
+        "scenario": "data-integrity-purge",
+        "target": target,
+        "details": f"Removed {removed} records from test/integrity and test/latency",
+        "removed": removed,
+        "errors": errors[:10],
+    }
+
+
 @router.post("/db-scenario/data-integrity/corrupt")
 def db_data_integrity_corrupt(request: DBScenarioRequest):
     """Step 1: Introduce data integrity issues (duplicates, NULLs, invalid values)."""

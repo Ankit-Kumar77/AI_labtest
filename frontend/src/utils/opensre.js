@@ -111,7 +111,7 @@ export function extractRecommendedActions(report = {}) {
       continue;
     }
 
-    const bullet = trimmed.match(/^[\u2022\-\*]\s+(.+)$/);
+    const bullet = trimmed.match(/^[\u2022*-]\s+(.+)$/);
     const numbered = trimmed.match(/^\d+[.)]\s+(.+)$/);
 
     const item = bullet ? bullet[1] : numbered ? numbered[1] : null;

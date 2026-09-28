@@ -484,7 +484,6 @@ export default function Aerospike() {
       </Card>
 
       <DbLogs
-        target="aerospike"
         podHint="databases/aerospike-0"
         fetchLive={(params) => dbInvestigationApi.aerospikeLogs(params)}
         fetchHistory={(params) => dbInvestigationApi.aerospikeLogHistory(params)}

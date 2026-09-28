@@ -1,0 +1,125 @@
+groups:
+  - name: opensre-rules
+    interval: 30s
+    rules:
+      # High p99 request latency on instrumented app pods.
+      # http_request_duration_highr_seconds_bucket is scraped by vmagent
+      # (job="kubernetes-pods") from pods annotated prometheus.io/scrape.
+      # NOTE: the `le` label MUST survive the aggregation or
+      # histogram_quantile returns nothing.
+      - alert: HighLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (namespace, pod, le) (
+              rate(http_request_duration_highr_seconds_bucket{job="kubernetes-pods"}[2m])
+            )
+          ) > ${LATENCY_HIGH_SECONDS}
+        for: ${LATENCY_HIGH_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "High p99 latency for {{ $labels.pod }} ({{ $labels.namespace }})"
+          description: "p99 request latency has been above ${LATENCY_HIGH_SECONDS}s for more than ${LATENCY_HIGH_FOR}."
+
+      - alert: CriticalLatency
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (namespace, pod, le) (
+              rate(http_request_duration_highr_seconds_bucket{job="kubernetes-pods"}[2m])
+            )
+          ) > ${LATENCY_CRITICAL_SECONDS}
+        for: ${LATENCY_CRITICAL_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical p99 latency for {{ $labels.pod }} ({{ $labels.namespace }})"
+          description: "p99 request latency has been above ${LATENCY_CRITICAL_SECONDS}s for more than ${LATENCY_CRITICAL_FOR}."
+
+      # High 5xx error ratio (guard against dividing by zero with `or`).
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum by (namespace, pod) (rate(http_requests_total{job="kubernetes-pods", status=~"5.."}[2m]))
+            /
+            clamp_min(sum by (namespace, pod) (rate(http_requests_total{job="kubernetes-pods"}[2m])), 0.001)
+          ) > ${ERROR_RATE_RATIO}
+        for: ${ERROR_RATE_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "High 5xx error rate for {{ $labels.pod }} ({{ $labels.namespace }})"
+          description: "More than ${ERROR_RATE_PERCENT}% of requests are returning 5xx for over ${ERROR_RATE_FOR}."
+
+      # CPU throttling: cgroup throttled seconds climbing.
+      - alert: HighCPU
+        expr: |
+          (
+            sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_seconds_total[5m]))
+            /
+            clamp_min(sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total[5m])), 0.001)
+          ) > ${CPU_THROTTLE_RATIO}
+        for: ${CPU_THROTTLE_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU throttling on {{ $labels.container }} ({{ $labels.pod }})"
+          description: "Container is being CPU-throttled more than ${CPU_THROTTLE_PERCENT}% of the time."
+
+      # Working-set memory as a share of the cgroup limit.
+      # Demo app pods are best-effort QoS, so their limit series are 0 --
+      # filter those out (> 0) and only score containers that really have a
+      # limit, otherwise the ratio explodes to the raw byte count.
+      - alert: HighMemory
+        expr: |
+          (
+            sum by (namespace, pod, container) (container_memory_working_set_bytes)
+            /
+            max by (namespace, pod, container) (
+              container_spec_memory_limit_bytes{namespace="opensre"} > 0
+            )
+          ) > ${MEMORY_RATIO}
+        for: ${MEMORY_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage for {{ $labels.container }} ({{ $labels.pod }})"
+          description: "Container working set is above ${MEMORY_PERCENT}% of its memory limit."
+
+      # Backstop for limitless (best-effort) containers.
+      - alert: HighMemoryAbsolute
+        expr: |
+          sum by (namespace, pod, container) (
+            container_memory_working_set_bytes{namespace="opensre"}
+          ) > ${MEMORY_ABSOLUTE_BYTES}
+        for: ${MEMORY_FOR}
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage for {{ $labels.container }} ({{ $labels.pod }})"
+          description: "Container working set is above ${MEMORY_ABSOLUTE_MIB}MiB."
+
+      # Restart loop detected from kube-state-metrics.
+      - alert: PodRestart
+        expr: |
+          increase(kube_pod_container_status_restarts_total[${RESTART_WINDOW}]) > ${RESTART_COUNT}
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod {{ $labels.pod }} is restarting repeatedly"
+          description: "{{ $labels.container }} has restarted more than 3 times in the last 10 minutes."
+
+      # CrashLoopBackOff / non-ready container detected from kube-state-metrics.
+      - alert: ContainerNotReady
+        expr: |
+          max by (namespace, pod, container) (
+            kube_pod_container_status_ready{namespace=~"opensre|databases|observability"} == 0
+          ) > 0
+        for: ${NOT_READY_FOR}
+        labels:
+          severity: critical
+        annotations:
+          summary: "Container {{ $labels.container }} in {{ $labels.pod }} is not ready"
+          description: "Container has been unready for more than ${NOT_READY_FOR}."

@@ -21,7 +21,6 @@ from app.core.config import settings
 NGINX_NAMESPACE = getattr(settings, "NGINX_NAMESPACE", "opensre")
 NGINX_LABEL = getattr(settings, "NGINX_LABEL", "app=nginx")
 NGINX_CONTAINER_NAME = getattr(settings, "NGINX_CONTAINER_NAME", "nginx")
-NGINX_CONFIG_PATH = "/etc/nginx/nginx.conf"
 
 # ---------------------------------------------------------------------------
 # Regexes for log parsing (covers default and custom log formats)
@@ -43,9 +42,6 @@ ERROR_PATTERNS = {
     "ssl_error": re.compile(r"SSL.*error|SSL_do_handshake.*failed", re.IGNORECASE),
     "too_many_open_files": re.compile(r"too many open files|accept\(\) failed", re.IGNORECASE),
 }
-
-HTTP_4XX_RE = re.compile(r'"\s(?P<status>4\d{2})\s')
-HTTP_5XX_RE = re.compile(r'"\s(?P<status>5\d{2})\s')
 
 def _run(cmd: list[str]):
     return run_command(cmd)
@@ -93,28 +89,6 @@ def get_nginx_pods(namespace: str | None = None, context: str | None = None):
         return {"success": True, "pods": pods, "count": len(pods), "raw": data}
     except Exception as e:
         return {"success": False, "error": str(e), "raw": result.get("stdout")}
-
-def get_nginx_pod_names(namespace: str | None = None, context: str | None = None):
-    res = get_nginx_pods(namespace, context)
-    if not res.get("success"):
-        return res
-    names = [p["name"] for p in res.get("pods", [])]
-    return {"success": True, "pods": names, "count": len(names)}
-
-def describe_nginx(namespace: str | None = None, pod_name: str | None = None, context: str | None = None):
-    """kubectl describe for nginx pod or deployment."""
-    ns = namespace or NGINX_NAMESPACE
-    if pod_name:
-        cmd = _kubectl_base(context) + ["describe", "pod", pod_name, "-n", ns]
-        return _run(cmd)
-    # fallback: describe deployment
-    cmd = _kubectl_base(context) + ["describe", "deployment", "-l", NGINX_LABEL, "-n", ns]
-    alt = _run(cmd)
-    if alt.get("success") and alt.get("stdout"):
-        return alt
-    # try get events for namespace
-    cmd2 = _kubectl_base(context) + ["get", "events", "-n", ns, "--sort-by=.lastTimestamp"]
-    return _run(cmd2)
 
 def get_nginx_events(namespace: str | None = None, context: str | None = None):
     ns = namespace or NGINX_NAMESPACE

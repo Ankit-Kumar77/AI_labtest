@@ -28,7 +28,6 @@ import {
   Table,
   AlertCircle,
   CheckCircle,
-  XCircle,
   Activity,
 } from "lucide-react";
 

@@ -5,7 +5,6 @@ from pathlib import Path
 from fastapi import APIRouter
 from pydantic import BaseModel
 
-from app.core.config import settings
 from app.services import portforward
 from app.utils.command import run_command
 
@@ -69,6 +68,8 @@ RECOVER_ACTIONS = {
     "yugabyte-connection-pressure-recover": "yugabyte-connection-pressure-recover",
     "aerospike-unavailable-recover": "aerospike-unavailable-recover",
     "aerospike-latency-recover": "aerospike-latency-recover",
+    "aerospike-integrity-recover": "aerospike-integrity-recover",
+    "yugabyte-integrity-recover": "yugabyte-integrity-recover",
 }
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -324,6 +325,24 @@ def recover(request: ActionRequest):
             "success": False,
             "error": f"Unknown recovery '{request.action}'. Available: {list(RECOVER_ACTIONS.keys())}",
         }
+
+    # Data-integrity recovery: purge the corruption the integrity scenarios
+    # wrote. Without this an injected corruption is permanent and the
+    # inject -> detect -> recover cycle can never return to healthy.
+    if action in {"aerospike-integrity-recover", "yugabyte-integrity-recover"}:
+        target = "yugabyte" if "yugabyte" in action else "aerospike"
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(
+                    f"http://127.0.0.1:8001/api/demo/db-scenario/data-integrity/purge",
+                    json={"target": target},
+                )
+                if resp.status_code == 200:
+                    return {"success": True, "action": action, "stdout": resp.text}
+                return {"success": False, "action": action,
+                        "error": resp.text[:400], "returncode": resp.status_code}
+        except Exception as exc:
+            return {"success": False, "action": action, "error": str(exc)}
 
     # Database failure recovery (K8s-based) - call demo API endpoints
     if action in {

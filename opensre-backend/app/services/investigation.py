@@ -2011,6 +2011,108 @@ def _normalize_alert(alert: dict, digest: str):
     }
 
 
+_PROBE_SCALARS = (
+    "status", "cluster_size", "nodes_checked", "records_scanned",
+    "entry_count", "record_count", "total_records", "objects", "replication_factor",
+)
+
+
+def _flatten_probe_scalars(data, depth=0, out=None):
+    """Pull decision-relevant scalars out of a probe's nested `data` payload.
+
+    Aerospike/Yugabyte probes nest their answers several levels deep and encode
+    the verdict as empty collections (no timeouts, no missing fields, all
+    latency buckets 0). Counting those is what tells the agent the check
+    actually passed rather than merely returned something.
+    """
+    if out is None:
+        out = []
+    if depth > 3 or not isinstance(data, (dict, list)):
+        return out
+    if isinstance(data, list):
+        for item in data[:3]:
+            _flatten_probe_scalars(item, depth + 1, out)
+        return out
+    for key, value in data.items():
+        if isinstance(value, (dict, list)):
+            _flatten_probe_scalars(value, depth + 1, out)
+        elif isinstance(value, bool):
+            continue
+        elif isinstance(value, (int, float)):
+            if key in _PROBE_SCALARS or key.endswith(("_ms", "_count", "_errors", "_latency_gt_1ms")):
+                out.append(f"{key}={value}")
+        elif isinstance(value, str) and len(value) < 40:
+            if key in ("status", "phase", "state", "role", "namespace", "set", "set_name"):
+                out.append(f"{key}={value}")
+    return out
+
+
+def _compact_probe(name: str, result: dict) -> str:
+    """Render one database probe result as a single digest line.
+
+    Probes return heterogeneous shapes, so this reports the outcome plus the
+    few numbers that decide the verdict, and states explicitly when a check
+    found nothing. An empty result set is the normal outcome for a database
+    with no writes - not a fault - and must not read as one.
+    """
+    label = name.replace("_", " ")
+    if not result.get("success"):
+        detail = result.get("error") or result.get("stderr") or "probe failed"
+        return f"{label}: FAILED ({str(detail)[:160]})"
+
+    data = result.get("data")
+    parts = _flatten_probe_scalars(data if data is not None else result)
+
+    # Empty error/timing collections are the strongest "healthy" signal the
+    # database layer produces; name them instead of printing nothing.
+    empties = []
+    populated = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, list) and len(key) < 40:
+                if value:
+                    # Non-empty is the fault case - surface the offending
+                    # values, not just the key, or the agent has no error text
+                    # to reason over. Render compactly: a raw dict repr for
+                    # each entry overflows the digest budget and truncates
+                    # mid-value.
+                    rendered = []
+                    for item in value[:3]:
+                        if isinstance(item, dict):
+                            field_name = item.get("field") or item.get("key")
+                            val = item.get("value")
+                            if field_name is not None:
+                                rendered.append(
+                                    f"{field_name}={val}" if val is not None
+                                    else f"{field_name}"
+                                )
+                            else:
+                                # A list of plain node/row dicts: a count is
+                                # more useful than a wall of empty keys.
+                                rendered.append(
+                                    "+".join(
+                                        f"{k}={v}" for k, v in list(item.items())[:3]
+                                        if not isinstance(v, (dict, list))
+                                    ) or "entry"
+                                )
+                        else:
+                            rendered.append(str(item)[:60])
+                    populated.append(f"{key}=[{', '.join(rendered)}]")
+                else:
+                    empties.append(key)
+            elif isinstance(value, dict) and not value and len(key) < 40:
+                empties.append(f"{key}(empty)")
+
+    if populated:
+        parts.extend(populated[:3])
+    if empties:
+        parts.append("checked, none found: " + ", ".join(empties[:3]))
+
+    if not parts:
+        return f"{label}: ok, no anomalies reported"
+    return f"{label}: " + ", ".join(parts[:7])
+
+
 def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int = 2200):
     """
     Compact, human-readable summary of the live facts collected for an alert.
@@ -2037,8 +2139,9 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
         lines.append(f"target pod: {pod['name']} (namespace {pod['namespace']})")
 
     k8s = evidence.get("kubernetes") or {}
-
-    state = k8s.get("state")
+    # The database collectors emit `pod_state`; the pod collector emits
+    # `state`. Accept either so pod facts are always rendered.
+    state = k8s.get("state") or k8s.get("pod_state")
     if state:
         lines.append(
             f"pod phase={state.get('phase')} "
@@ -2148,9 +2251,67 @@ def _evidence_digest(alert: dict, evidence: dict, git_corr=None, max_chars: int 
             pieces.append(f"restarts={pod_metrics['restarts']}")
         lines.append("pod metrics (last 1m): " + ", ".join(pieces))
 
+    # Database runtime state. Collected by the database evidence path and
+    # previously dropped here, so the agent got namespace counters but no
+    # statement about whether the pod was actually up. `pod_state` already
+    # renders container readiness above, so only add the current-vs-historical
+    # distinction that the flattened kubectl state cannot make.
+    container = evidence.get("container") or {}
+    cstate = container.get("state") or {}
+    if isinstance(cstate, dict) and cstate.get("success") and not state:
+        lines.append(
+            f"container {cstate.get('pod') or cstate.get('name')}: "
+            f"ready={cstate.get('running')} status={cstate.get('status')} "
+            f"restarts={cstate.get('restart_count')} "
+            f"oom_killed={cstate.get('oom_killed')}"
+        )
+    elif not state and container.get("state_error"):
+        lines.append(f"container state unavailable: {container['state_error'][:200]}")
+
+    # A restart is only meaningful alongside the logs of the run that died.
+    last = cstate.get("last_state") or {}
+    if last.get("reason"):
+        lines.append(
+            f"HISTORICAL (previous run, container is healthy now): "
+            f"reason={last.get('reason')} exitCode={last.get('exit_code')} "
+            f"finishedAt={last.get('finished_at')}"
+        )
+    prev_logs = (container.get("previous_logs") or "").strip().splitlines()
+    if prev_logs:
+        lines.append("previous run logs (explain the exit code above):")
+        lines.extend(f"  {line[:220]}" for line in prev_logs[-5:] if line.strip())
+
+    # Client-side database probe results: the actual health/latency/error
+    # verdict, which is the whole point of a database investigation.
+    investigations = evidence.get("investigations") or {}
+    if isinstance(investigations, dict) and investigations:
+        lines.append("database probe results:")
+        for name, result in list(investigations.items())[:9]:
+            if not isinstance(result, dict):
+                continue
+            summary = _compact_probe(name, result)
+            if summary:
+                lines.append(f"  {summary}")
+
+    # Elasticsearch / metrics availability for this target. The generic ES
+    # block further down expects the pod-path shape (es.clean/signal_counts);
+    # on the database path those keys are absent, so report reachability here
+    # instead of duplicating the same sentence twice.
+    es_health = (evidence.get("elasticsearch") or {}).get("health") or {}
+    if isinstance(es_health, dict) and es_health.get("success"):
+        errors = (evidence.get("elasticsearch") or {}).get("recent_errors") or {}
+        count = len(errors.get("entries") or errors.get("logs") or []) if isinstance(errors, dict) else 0
+        lines.append(
+            f"ES log archive: reachable, {count} recent error entries in last 180m"
+        )
+
+    metrics_health = (evidence.get("metrics") or {}).get("health") or {}
+    if isinstance(metrics_health, dict) and metrics_health.get("success"):
+        lines.append(f"metrics backend: {metrics_health.get('status') or 'reachable'}")
+
     # Elasticsearch log signals summary
     es = evidence.get("elasticsearch") or {}
-    if (es.get("health") or {}).get("success"):
+    if (es.get("health") or {}).get("success") and not es.get("recent_errors"):
         if es.get("clean"):
             lines.append(f"ES: healthy and clean — no logs for this pod in the last 60m (log_total={es.get('log_total', 0)})")
         elif es.get("signal_counts", 0) > 0:
@@ -2414,6 +2575,207 @@ def pod_alert_payload(evidence: dict, namespace: str, pod_name: str) -> dict:
         f"Investigate Kubernetes pod {pod_name} in namespace {namespace}. "
         "Determine root cause, confidence, evidence, timeline, affected "
         "component, and remediation from the attached evidence."
+    )
+    return payload
+
+
+def _probe_indicates_degradation(investigations) -> bool:
+    """True when the database's own probes report a fault.
+
+    Covers the injected failure modes the pod state cannot see: a Running pod
+    with connections refused, latency spikes, or data-integrity violations.
+    Without this, `healthy` came from container readiness alone and a degraded
+    database was reported as healthy.
+    """
+    if not isinstance(investigations, dict):
+        return False
+
+    # Failed probes that are not the health check itself.
+    for name, result in investigations.items():
+        if name == "health" or not isinstance(result, dict):
+            continue
+        if result.get("success") is False:
+            return True
+
+    # Error/timeout collections that actually contain entries.
+    errs = investigations.get("operation_errors")
+    if isinstance(errs, dict):
+        data = errs.get("data") or {}
+        if isinstance(data, dict):
+            for key in ("connection_errors", "timeouts", "client_errors", "server_errors"):
+                if data.get(key):
+                    return True
+
+    # Latency: any non-zero bucket in the high-latency ranges means degraded.
+    lat = investigations.get("latency")
+    if isinstance(lat, dict):
+        data = lat.get("data")
+        buckets = []
+        if isinstance(data, list):
+            for row in data:
+                if isinstance(row, dict):
+                    buckets.append(row)
+        elif isinstance(data, dict):
+            buckets.append(data)
+        for row in buckets:
+            for key, value in row.items():
+                if isinstance(value, (int, float)) and "latency" in key and value > 0:
+                    return True
+            nested = row.get("latency")
+            if isinstance(nested, dict) and any(
+                isinstance(v, (int, float)) and v > 0 for v in nested.values()
+            ):
+                return True
+
+    # Data integrity violations - check every integrity probe present, since
+    # the collector scans more than one set.
+    for name, integ in investigations.items():
+        if "integrity" not in name or not isinstance(integ, dict):
+            continue
+        data = integ.get("data") or {}
+        if isinstance(data, dict):
+            for key in ("missing_required_fields", "duplicate_logical_records",
+                        "invalid_field_values"):
+                if data.get(key):
+                    return True
+    return False
+
+
+def database_alert_payload(evidence: dict, database: str, pod_name: str) -> dict:
+    """
+    Build the alert-shaped payload the OpenSRE CLI reads for a database
+    investigation.
+
+    Same mechanism and same reason as `pod_alert_payload`: the CLI has no live
+    database or k8s tool integrations here, so it can only ground on this
+    payload. The database path passed the raw probe result instead, which is
+    not alert-shaped (no status/alertname/labels/annotations), so the CLI's
+    alert extractor had nothing to key on and every run fell through to the
+    parser's generic "Unable to determine root cause" — including for a
+    completely healthy, empty database.
+
+    Health is decided here, deterministically, from the collected signals
+    rather than left to the model: a healthy database is emitted as a
+    resolved/info alert so the model is not anchored by a "firing" envelope it
+    has to argue against.
+    """
+    k8s = evidence.get("kubernetes") or {}
+    container = evidence.get("container") or {}
+    state = container.get("state") or {}
+    pod_state = k8s.get("pod_state") or {}
+
+    phase = pod_state.get("phase")
+    if not isinstance(phase, str):
+        phase = None
+
+    probe = (evidence.get("investigations") or {}).get("health") or {}
+    probe_healthy = bool(probe.get("success"))
+    container_healthy = bool(state.get("success") and state.get("running"))
+
+    # A failing client probe is authoritative and must not be overridden by
+    # "the container is up". A pod can stay Running while the database
+    # refuses connections, is latency-bound, or is unreachable through the
+    # port-forward - reporting that as healthy is exactly the false negative
+    # this investigation exists to catch.
+    latency_bad = _probe_indicates_degradation(evidence.get("investigations") or {})
+
+    if not probe_healthy:
+        healthy = False
+    elif latency_bad:
+        healthy = False
+    elif container_healthy:
+        healthy = True
+    elif phase:
+        healthy = phase == "Running"
+    else:
+        healthy = probe_healthy
+
+    if healthy:
+        alertname = f"Database Healthy: {database}"
+        alert = {
+            "status": "resolved",
+            "alertname": alertname,
+            "labels": {
+                "alertname": alertname,
+                "severity": "info",
+                "namespace": (state.get("namespace") or "databases"),
+                "pod": pod_name,
+                "cluster": "kind-opensre-demo",
+                "component": database,
+            },
+            "annotations": {
+                "summary": (
+                    f"Health check of {database} completed. The database "
+                    "pod is Running and the client reported no errors. "
+                    "No anomaly was observed, so a healthy verdict is the "
+                    "expected result. Report it as healthy with the checks "
+                    "that passed - do not invent a failure, and do not claim "
+                    "a root cause for a system that is not broken."
+                ),
+            },
+        }
+    else:
+        alertname = f"Database Unhealthy: {database}"
+        reasons = []
+        if not probe_healthy:
+            detail = probe.get("error") or probe.get("hint") or "client probe failed"
+            reasons.append(f"the {database} client probe failed: {str(detail)[:200]}")
+        if latency_bad:
+            reasons.append(
+                "the database reported operation errors, elevated latency, or "
+                "data-integrity violations"
+            )
+        if not container_healthy and phase != "Running":
+            reasons.append(f"kubernetes phase is {phase or 'unknown'}")
+        alert = {
+            "status": "firing",
+            "alertname": alertname,
+            "labels": {
+                "alertname": alertname,
+                "severity": "high",
+                "namespace": (state.get("namespace") or "databases"),
+                "pod": pod_name,
+                "cluster": "kind-opensre-demo",
+                "component": database,
+            },
+            "annotations": {
+                "summary": (
+                    f"The {database} database is NOT healthy. "
+                    + "; ".join(reasons or ["evidence indicates a fault"])
+                    + ". Tie the root cause strictly to these signals - do not "
+                    "invent a cluster-wide outage or an infrastructure failure "
+                    "the evidence does not show."
+                ),
+            },
+        }
+
+    payload = _normalize_alert(alert, _evidence_digest(alert, evidence, evidence.get("git")))
+
+    # Preserve structured runtime state so the grounding guard can tell a
+    # healthy database from a failing one, and so the model can see the
+    # container's own view next to the client-side probe results.
+    if isinstance(phase, str):
+        payload.setdefault("kubernetes", {})["state"] = {
+            "phase": phase,
+            "name": pod_name,
+            "pod": pod_name,
+            "namespace": state.get("namespace") or "databases",
+        }
+    if state.get("success"):
+        payload.setdefault("kubernetes", {})["container"] = {
+            "ready": state.get("running"),
+            "status": state.get("status"),
+            "restart_count": state.get("restart_count"),
+            "current_oom_killed": state.get("oom_killed"),
+        }
+    if state.get("last_state", {}).get("reason"):
+        payload["kubernetes"]["container_last_state"] = state["last_state"]
+
+    payload["question"] = evidence.get("question") or (
+        f"Investigate the {database} database for any issues. Determine root "
+        "cause, confidence, evidence, timeline, affected component and "
+        "remediation from the attached evidence. If the evidence shows the "
+        "system is healthy, report it as healthy."
     )
     return payload
 

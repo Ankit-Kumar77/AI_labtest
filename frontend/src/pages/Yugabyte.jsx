@@ -8,7 +8,6 @@ import {
   CheckCircle2,
   XCircle,
   Loader2,
-  Terminal,
   Play,
   Table,
   List,
@@ -568,7 +567,6 @@ export default function Yugabyte() {
       </Card>
 
       <DbLogs
-        target="yugabyte"
         podHint="databases/yugabytedb-0"
         fetchLive={(params) => dbInvestigationApi.yugabyteLogs(params)}
         fetchHistory={(params) => dbInvestigationApi.yugabyteLogHistory(params)}

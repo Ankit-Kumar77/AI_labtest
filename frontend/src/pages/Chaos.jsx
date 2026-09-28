@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import api, { dbInvestigationApi, nginxDemoApi, corednsDemoApi, elkDemoApi, elkApi } from "../api/api";
+import api, { nginxDemoApi, corednsDemoApi, elkDemoApi } from "../api/api";
 import Card from "../components/Card";
 import Badge from "../components/Badge";
 import {
@@ -17,8 +17,6 @@ import {
   Timer,
   Activity,
   ListChecks,
-  Copy,
-  Trash2,
   AlertCircle,
   Globe,
   ChevronDown,

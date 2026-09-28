@@ -10,6 +10,7 @@ The whole stack — Kubernetes, the observability pipeline, and the databases �
 
 - [Overview](#overview)
 - [Architecture](#architecture)
+- [Alert-driven investigations](#alert-driven-investigations)
 - [Technology Stack](#technology-stack)
 - [Prerequisites](#prerequisites)
 - [First-Time Setup](#first-time-setup)
@@ -124,6 +125,138 @@ Evidence digest embedded into alert description
      ▼
 OpenSRE CLI agent loop ──► structured RCA (root cause, evidence, impact,
                             timeline, recommendation, confidence)
+```
+
+---
+
+## Alert-driven investigations
+
+The dashboard used to require you to click **Investigate** by hand. It now also
+picks alerts up on its own, end to end:
+
+```
+VictoriaMetrics
+     │
+     ▼
+vmalert          (infra/k8s/alerting/vmalert.yaml)
+  └─ 8 rules: latency, error rate, CPU, memory, restarts, readiness
+     │  fires after `for:` so transient noise never triggers an RCA
+     ▼
+Alertmanager     (infra/k8s/alerting/alertmanager.yaml)
+  └─ groups alerts, waits 10s, dedups repeat notifications
+     │  POST http://opensre-backend.opensre.svc.cluster.local:8001/api/alerts/alertmanager
+     ▼
+Backend          (opensre-backend/app/routes/alerts.py)
+  ├─ fingerprint-deduplicate  → one incident per alert, not per notification
+  ├─ trigger the SAME evidence + OpenSRE CLI RCA path used by the UI
+  └─ publish lifecycle event ──► SSE ──► navbar bell
+     │                              └──► Slack (optional)
+     ▼
+Incidents page   (persisted, survives the browser session)
+```
+
+### Why the backend runs in-cluster
+
+Alertmanager is a pod, so it must reach the backend over the cluster network.
+It posts to the `opensre-backend` **Service DNS name** — never `localhost`,
+which would resolve to the Alertmanager pod itself.
+
+Alerts and incidents are written to the `opensre-backend-data` PVC, so the store
+survives pod rollouts and restarts.
+
+### Pointing the UI at the in-cluster backend
+
+The frontend talks to `http://127.0.0.1:8001/api`. To see the **same** store the
+alerting pipeline writes to, forward the in-cluster Service instead of starting a
+second local backend process:
+
+```bash
+setsid kubectl -n opensre port-forward svc/opensre-backend 8001:8001 \
+  >/tmp/opensre-backend-pf.log 2>&1 &
+```
+
+This matters: running a local backend process as well gives you two independent
+stores, and alerts ingested in-cluster will not appear in the UI.
+
+> Rootless Podman Kind isolates host and cluster networks, so `ClusterIP` and
+> `NodePort` are not reachable from the host. `port-forward` is the supported
+> path.
+
+### Alert rules
+
+| Rule | Fires when |
+| --- | --- |
+| `HighLatency` | p99 > 2s for 1m |
+| `CriticalLatency` | p99 > 10s for 2m |
+| `HighErrorRate` | 5xx > 5% of requests for 2m |
+| `HighCPU` | throttled > 50% of CFS periods for 5m |
+| `HighMemory` | working set > 90% of the container limit for 5m |
+| `HighMemoryAbsolute` | working set > 256Mi for 5m (catches BestEffort pods, which declare no limit) |
+| `PodRestart` | container restarts ≥ 3 within 10m |
+| `ContainerNotReady` | container not ready for 2m |
+
+### Changing a threshold
+
+`infra/k8s/alerting/rules/thresholds.env` is the **single source of truth** for
+every threshold. `alert-rules.yaml` (structure) and `vmalert.yaml` (rendered
+manifest) are both inputs/outputs of the generator, so there is no second copy
+to keep in sync.
+
+```bash
+python3 infra/k8s/alerting/render.py           # rewrite vmalert.yaml
+python3 infra/k8s/alerting/render.py --check    # non-zero if stale (used by tests/CI)
+kubectl apply -f infra/k8s/alerting/            # alerting + rendered rules
+```
+
+`--stdout` prints the manifest instead of writing it, and any variable can be
+overridden for a one-off render (e.g. `LATENCY_HIGH_SECONDS=0.5 python3 ...`).
+`opensre-backend/tests/test_alert_rules_sync.py` fails if `vmalert.yaml` no
+longer matches the sources.
+
+### The alert bell
+
+The navbar bell is a notification center: it lists recent alerts, badges
+unread events, and shows a `live` / `polling` indicator. It consumes the SSE
+feed at `GET /api/alerts/stream` and reconciles against `GET /alerts`, falling
+back to polling if the stream drops.
+
+### Alert API
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/alerts/alertmanager` | Alertmanager webhook (validated) |
+| `GET` | `/api/alerts` | Recent alert lifecycles |
+| `GET` | `/api/alerts/active` | Firing only |
+| `GET` | `/api/alerts/{fingerprint}` | One lifecycle |
+| `GET` | `/api/alerts/stream` | SSE lifecycle events |
+| `DELETE` | `/api/alerts` | Clear the store |
+
+### Slack (optional)
+
+Set `SLACK_WEBHOOK_URL` in `opensre-backend/.env` (local) or on the
+`opensre-backend-secrets` Secret (in-cluster) to mirror every firing and
+resolved alert to a channel. Leave it empty to disable Slack. Delivery is
+asynchronous and failures are logged, never raised — a Slack outage cannot
+block ingestion or the RCA pipeline. The webhook URL is backend-only and is
+never sent to the browser.
+
+### Validating the pipeline by hand
+
+```bash
+# Fire a synthetic alert through the real webhook
+curl -s -X POST http://127.0.0.1:8001/api/alerts/alertmanager \
+  -H 'Content-Type: application/json' \
+  -d '{"alerts":[{"status":"firing","labels":{"alertname":"ManualProbe",
+       "namespace":"opensre","pod":"probe-pod","severity":"warning"},
+       "annotations":{"summary":"manual probe"}}]}'
+
+curl -s http://127.0.0.1:8001/api/alerts/active
+```
+
+The bell should light up within a second. Then watch a real one:
+
+```bash
+CLUSTER=kind-opensre-demo POD_LATENCY_MS=5000 ./chaos/runbook.sh pod-latency
 ```
 
 ---
@@ -460,15 +593,17 @@ Useful for running commands inside a pod:
 │   │   ├── main.py           # FastAPI entrypoint
 │   │   ├── routes/           # HTTP route modules, one per data source
 │   │   ├── services/         # Connectors, evidence collectors, OpenSRE orchestration
+│   │   │   └── alert_store.py  # Fingerprint-deduplicated alert lifecycle store
 │   │   ├── models/           # Pydantic schemas
 │   │   ├── core/             # Config, logging
 │   │   └── utils/            # Shared helpers
 │   ├── tests/                # pytest suite
+│   ├── Dockerfile            # In-cluster backend image
 │   └── .env                  # Local config (git-ignored)
 ├── frontend/
 │   └── src/
 │       ├── pages/            # 13 routed pages
-│       ├── components/       # Shared UI
+│       ├── components/       # Shared UI (incl. AlertNotifications.jsx bell)
 │       ├── api/              # Axios client
 │       └── hooks/
 ├── infra/
@@ -476,6 +611,8 @@ Useful for running commands inside a pod:
 │   └── k8s/
 │       ├── yugabytedb/       # StatefulSet + services
 │       ├── aerospike/        # StatefulSet + services
+│       ├── alerting/         # vmalert + Alertmanager + alert rules
+│       ├── opensre-backend/  # Backend Deployment, Service, RBAC, Secret example
 │       └── faults/           # Deliberately broken workloads
 ├── observability/
 │   ├── install.sh            # Idempotent, pinned-version stack installer
@@ -492,18 +629,12 @@ Useful for running commands inside a pod:
 │   └── experiments/          # Inject/recover event log (git-ignored)
 ├── scripts/
 │   └── investigate-alert.sh  # Terminal-driven RCA, no UI required
-├── docker-compose.yml        # Optional standalone DBs (see below)
 ├── SETUP_GUIDE.txt
 └── guide for running
 ```
 
-### `docker-compose.yml`
-
-Retained for convenience, but **not part of the default path**. The databases and
-Elasticsearch are meant to run inside the Kind cluster.
-
-Keep any `docker-compose.yml` Elasticsearch **stopped** when the in-cluster
-Elasticsearch port-forward is active — both bind host port 9200 and will conflict.
+There is no `docker-compose.yml`: the databases and Elasticsearch run inside
+the Kind cluster, and `chaos/runbook.sh` drives them from there.
 
 ---
 
@@ -629,6 +760,10 @@ report, with a degraded/recovered verdict. Every inject and recover is appended 
 ## API Reference
 
 Interactive documentation is available at http://localhost:8001/docs.
+
+Alert endpoints (`/api/alerts/*`, including the Alertmanager webhook and the
+SSE stream) are listed in
+[Alert-driven investigations](#alert-api).
 
 ### Health
 
@@ -895,10 +1030,24 @@ Background jobs are killed with the parent shell. Use `setsid` — see
 
 ### 9. Investigation returns "investigation failed"
 
-Usually a model quota limit, not an evidence problem. The OpenSRE CLI uses the
-Gemini free tier, which is capped at roughly 20 requests/day per model plus
-per-minute token limits. One investigation runs a multi-step agent loop and can
-exhaust the daily budget on its own.
+Usually an LLM provider limit, not an evidence problem. The backend defaults to
+OpenRouter (`LLM_PROVIDER=openrouter`); Gemini's free tier is capped at roughly
+20 requests/day per model, which one multi-step agent loop exhausts on its own.
+
+The alert API returns a specific `error` and `hint` for provider failures:
+
+| Symptom | Meaning | Fix |
+| --- | --- | --- |
+| `quota exhausted`, `429`, `RESOURCE_EXHAUSTED` | Daily/rate budget gone | Space out investigations or use a funded key |
+| `rejected the API key`, `403 PERMISSION_DENIED` | Key not valid for that provider | Re-issue the key and update the Secret |
+| `can only afford N` (OpenRouter `402`) | Per-request ceiling, **not** a depleted balance | Raise the key's total limit in the OpenRouter dashboard — see below |
+| `exceed your available credits given your current in-flight requests` | Free-tier concurrency limit | Already retried with backoff and serialised automatically |
+
+OpenSRE asks for a **fixed 4096 output tokens** per call and that value is not
+configurable. If a key can only afford fewer than 4096 tokens per request it will
+fail every investigation regardless of how much credit it holds; the fix is to
+raise the key's limit (OpenRouter: Settings → API keys → edit the key's limit)
+or switch `LLM_PROVIDER`.
 
 Verify evidence collection still works independently:
 
@@ -906,7 +1055,8 @@ Verify evidence collection still works independently:
 curl -s http://localhost:8001/api/opensre/investigate/node/opensre-demo-worker
 ```
 
-Space investigations out, or point the CLI at a paid provider for sustained use.
+Because a failed LLM step never discards collected evidence, the same response
+still carries the evidence digest for manual review.
 
 ### 10. OpenTelemetry collector in `CrashLoopBackOff`
 

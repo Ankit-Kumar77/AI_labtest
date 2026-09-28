@@ -2,7 +2,6 @@ import json
 import shutil
 
 from app.utils.command import run_command
-from app.core.config import settings
 
 
 def _runtime():
@@ -67,17 +66,46 @@ def container_state(name):
                 
                 if container_statuses:
                     cs = container_statuses[0]
+                    ready = bool(cs.get("ready", False))
+                    last_terminated = (cs.get("lastState") or {}).get("terminated") or {}
+                    last_reason = last_terminated.get("reason")
+                    last_exit = last_terminated.get("exitCode")
+                    # `lastState` describes a PREVIOUS run. Reporting it through
+                    # the same flat keys as current state made a healthy pod
+                    # look broken: aerospike-0 rendered
+                    # running=true, status=Running, error="Error", exit_code=165
+                    # because a prior attempt had died, which pushed the RCA
+                    # model into inventing a current outage. Keep historical
+                    # facts under `last_state` and only surface exit/error at
+                    # the top level when the container is NOT currently running.
                     return {
                         "success": True,
                         "name": name,
-                        "running": cs.get("ready", False),
+                        "pod": pod_name,
+                        "namespace": ns,
+                        "running": ready,
+                        "ready": ready,
                         "status": status.get("phase"),
-                        "exit_code": cs.get("lastState", {}).get("terminated", {}).get("exitCode"),
                         "restart_count": cs.get("restartCount", 0),
-                        "oom_killed": cs.get("lastState", {}).get("terminated", {}).get("reason") == "OOMKilled",
-                        "error": cs.get("lastState", {}).get("terminated", {}).get("reason"),
-                        "started_at": cs.get("state", {}).get("running", {}).get("startedAt"),
-                        "finished_at": cs.get("lastState", {}).get("terminated", {}).get("finishedAt"),
+                        "oom_killed": (
+                            (cs.get("state") or {}).get("terminated") or {}
+                        ).get("reason") == "OOMKilled",
+                        "started_at": (cs.get("state") or {}).get("running", {}).get("startedAt"),
+                        "exit_code": None if ready else last_exit,
+                        "error": None if ready else last_reason,
+                        "finished_at": (
+                            (cs.get("state") or {}).get("terminated") or {}
+                        ).get("finishedAt"),
+                        "last_state": {
+                            "reason": last_reason,
+                            "exit_code": last_exit,
+                            "finished_at": last_terminated.get("finishedAt"),
+                            "oom_killed": last_reason == "OOMKilled",
+                            "note": (
+                                "historical: describes a PREVIOUS container run, "
+                                "not current runtime state"
+                            ),
+                        },
                         "pod_phase": status.get("phase"),
                         "pod_ip": status.get("podIP"),
                     }
@@ -87,13 +115,22 @@ def container_state(name):
     return {"success": False, "error": f"Container/pod '{name}' not found", "tried": ["docker/podman", "kubernetes"]}
 
 
-def container_logs(name, tail=150):
-    """Get container logs - works for both Docker containers and K8s pods."""
+def container_logs(name, tail=150, previous=False):
+    """Get container logs - works for both Docker containers and K8s pods.
+
+    `previous=True` fetches the logs of the run BEFORE the current one. For a
+    restarted container these are the only logs that explain the non-zero exit
+    code surfaced in `last_state`; without them the RCA has an unexplained
+    `exit_code`/`reason` and guesses a cause.
+    """
     # Try Docker/Podman first
     runtime = _runtime()
     
     if runtime:
-        result = run_command([runtime, "logs", "--tail", str(tail), name])
+        cmd = [runtime, "logs", "--tail", str(tail)]
+        if previous:
+            cmd.append("--previous")
+        result = run_command(cmd + [name])
         if result.get("success"):
             return result
     
@@ -106,6 +143,9 @@ def container_logs(name, tail=150):
     if name in k8s_pods:
         ns = "databases"
         pod_name = k8s_pods[name]
-        return run_command(["kubectl", "logs", pod_name, "-n", ns, "--tail", str(tail)])
+        cmd = ["kubectl", "logs", pod_name, "-n", ns, "--tail", str(tail)]
+        if previous:
+            cmd.append("--previous")
+        return run_command(cmd)
     
     return {"success": False, "error": f"Could not find container/pod '{name}'"}

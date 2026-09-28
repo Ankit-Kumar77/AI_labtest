@@ -72,7 +72,7 @@ export function parseFindings(markdown = "") {
       continue;
     }
 
-    const bullet = trimmed.match(/^[\u2022\*\-\u2023]\s+(.*)$/);
+    const bullet = trimmed.match(/^[\u2022\u2023*-]\s+(.*)$/);
 
     if (bullet) {
       const numbered = bullet[1].match(/^\(?\d+[).]\s+(.*)$/);

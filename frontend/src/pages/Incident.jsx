@@ -488,7 +488,6 @@ export default function Incident() {
   const logAnalysis = evidence?.kubernetes?.log_analysis || null;
   const relevantLogLines = logAnalysis?.relevant_lines || [];
   const signalCounts = logAnalysis?.signal_counts || {};
-  const structuredEvents = evidence?.kubernetes?.events_structured || [];
   const timeline = evidence?.kubernetes?.timeline || [];
   const logsTail = evidence?.kubernetes?.logs_tail || "";
   const logsPrevious = evidence?.kubernetes?.logs_previous || "";

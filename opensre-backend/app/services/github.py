@@ -1,6 +1,4 @@
-import os
 import httpx
-from datetime import datetime, timedelta
 
 from app.core.config import settings
 
@@ -139,14 +137,6 @@ def get_workflow_runs(limit: int = 20):
 
 def get_workflow_run(run_id: int):
     return github.get_workflow_run(run_id)
-
-
-def get_workflow_run_jobs(run_id: int):
-    return github.get_workflow_run_jobs(run_id)
-
-
-def get_workflow_run_logs(run_id: int, job_id: int):
-    return github.get_workflow_run_logs(run_id, job_id)
 
 
 def get_workflow_run_jobs_with_logs(run_id: int):

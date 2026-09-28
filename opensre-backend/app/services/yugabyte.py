@@ -398,27 +398,6 @@ def schema_info(schema: str = "public"):
     }
 
 
-def record_inspection(table: str, where: dict | None = None, limit: int = 50, schema: str = "public"):
-    """Safely inspect records from a table with optional filtering."""
-    if not table or not table.replace("_", "").isalnum():
-        return {"success": False, "error": "Invalid table name"}
-
-    where_clause = ""
-    params = []
-    if where:
-        conditions = []
-        for k, v in where.items():
-            if not k.replace("_", "").isalnum():
-                return {"success": False, "error": f"Invalid column name: {k}"}
-            conditions.append(f"{k} = %s")
-            params.append(v)
-        where_clause = "WHERE " + " AND ".join(conditions)
-
-    sql = f"SELECT * FROM {schema}.{table} {where_clause}"
-    params.append(limit)
-    return _execute_with_timeout(sql, params=tuple(params), limit=limit)
-
-
 def data_integrity_checks(schema: str = "public", limit: int = 100):
     """Run data integrity checks: duplicates, NULLs in required fields, constraint violations."""
     results = {}

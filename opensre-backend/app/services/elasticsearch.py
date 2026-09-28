@@ -12,11 +12,8 @@ When Elasticsearch is unreachable the connector returns an explicit
 
 import datetime
 import logging
-import time
-from typing import Any
 
 from app.core.config import settings
-from app.utils.command import run_command
 
 logger = logging.getLogger("elk")
 

@@ -66,13 +66,6 @@
   gap: var(--space-3);
 }
 
-.spread {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-}
-
 /* ---------- Sidebar ---------- */
 
 .sidebar {
@@ -454,10 +447,6 @@
   font-variant-numeric: tabular-nums;
 }
 
-.stat-card__value--sm {
-  font-size: var(--fs-lg);
-}
-
 .stat-card__trend {
   margin-top: var(--space-3);
   font-size: var(--fs-xs);
@@ -537,9 +526,13 @@
   color: var(--text);
 }
 
-.btn--danger {
-  background: var(--danger);
+.btn--success {
+  background: var(--success);
   color: #fff;
+}
+
+.btn--success:hover:not(:disabled) {
+  filter: brightness(1.1);
 }
 
 .btn--sm {
@@ -1806,12 +1799,6 @@ details.raw-output summary:hover {
 
 /* ---------- Chat ---------- */
 
-.chat {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
 .chat__window {
   flex: 1;
   min-height: 320px;
@@ -2117,4 +2104,181 @@ details.raw-output summary:hover {
   .chat__footer .btn {
     width: 100%;
   }
+}
+/* ---------- Alert notification center ---------- */
+
+.alertbell {
+  position: relative;
+  margin-right: var(--space-3);
+}
+
+.alertbell__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.alertbell__trigger:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.alertbell__badge {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--danger);
+  color: var(--text-invert);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+
+.alertbell__caret {
+  transition: transform 0.15s ease;
+}
+
+.alertbell__caret--open {
+  transform: rotate(180deg);
+}
+
+.alertbell__panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + var(--space-2));
+  z-index: 40;
+  width: 340px;
+  max-height: 420px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+
+.alertbell__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.alertbell__live {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.alertbell__live--on {
+  color: var(--success);
+}
+
+.alertbell__empty {
+  margin: 0;
+  padding: var(--space-6) var(--space-4);
+  color: var(--text-4);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
+
+.alertbell__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.alertbell__item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.alertbell__item:last-child {
+  border-bottom: none;
+}
+
+.alertbell__dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-top: 5px;
+  border-radius: 50%;
+}
+
+.alertbell__dot--firing {
+  background: var(--danger);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.alertbell__dot--ok {
+  background: var(--success);
+}
+
+.alertbell__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.alertbell__title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.alertbell__sev {
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  background: var(--surface-3);
+  color: var(--text-3);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.alertbell__meta {
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  color: var(--text-4);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alertbell__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.alertbell__state--firing {
+  color: var(--danger);
+}
+
+.alertbell__state--ok {
+  color: var(--success);
 }

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
 from app.services import aerospike

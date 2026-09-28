@@ -10,6 +10,18 @@ class Settings:
 
     OPENSRE_BINARY = os.getenv("OPENSRE_BINARY", "opensre")
 
+    # LLM provider for the OpenSRE agent.
+    #
+    # The CLI reads these from the environment, and the backend passes its own
+    # environment through to the subprocess, so no CLI-side config file is
+    # needed in the pod. Default to openrouter: the Gemini free tier allows only
+    # ~20 requests/day, which is not enough for an alert-driven RCA pipeline.
+    # Set LLM_PROVIDER=gemini (and GEMINI_API_KEY) to go back to Gemini.
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openrouter")
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
     VICTORIA_METRICS_URL = os.getenv(
         "VICTORIA_METRICS_URL",
         "http://localhost:8428",

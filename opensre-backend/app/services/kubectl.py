@@ -591,20 +591,6 @@ def uncordon_node(node_name: str, context: str | None = None):
     return run_command(command)
 
 
-def drain_node(node_name: str, context: str | None = None, grace_period: int = 30):
-    command = ["kubectl"]
-    if context:
-        command.extend(["--context", context])
-    command.extend([
-        "drain", node_name,
-        "--ignore-daemonsets",
-        "--delete-emptydir-data",
-        "--grace-period", str(grace_period),
-        "--force",
-    ])
-    return run_command(command)
-
-
 def get_node_resource_usage(node_name: str, context: str | None = None):
     """Get pods on a node and summarize resource usage."""
     command = ["kubectl"]

@@ -5,7 +5,6 @@ from aerospike import predicates as p
 from app.core.config import settings
 
 
-MAX_SCAN_RECORDS = 1000
 DEFAULT_SCAN_LIMIT = 100
 
 
@@ -136,19 +135,6 @@ def _parse_info_stats(stats_str):
             k, v = part.split("=", 1)
             stats[k] = v
     return stats
-
-
-def _get_node_names(client):
-    """Get node names from the client."""
-    try:
-        info = client.info_all("node")
-        node_names = []
-        for node_name, data in info.items():
-            if data and len(data) > 1 and data[1]:
-                node_names.append(node_name)
-        return node_names
-    except Exception:
-        return []
 
 
 def cluster_health():
@@ -433,7 +419,7 @@ def data_integrity_checks(namespace: str, set_name: str,
         
         records_seen = {}
         missing_counts = {field: 0 for field in (required_fields or [])}
-        invalid_counts = {field: 0 for field in (required_fields or [])}
+        invalid_counts = {}
         
         scan = client.scan(namespace, set_name)
         
@@ -443,7 +429,17 @@ def data_integrity_checks(namespace: str, set_name: str,
                 return
             
             bins = r[2]
-            key = bins.get("_key") or r[0][2] or ""
+            key_tuple = r[0]
+            # Key tuple is (namespace, set, digest, user_key). Index 2 is the
+            # binary digest, which reported findings as unreadable hex blobs;
+            # prefer the user key at index 3.
+            key = (
+                bins.get("_key")
+                or (key_tuple[3] if len(key_tuple) > 3 else None)
+                or ""
+            )
+            if isinstance(key, (bytes, bytearray)):
+                key = key.decode("utf-8", "replace")
             results["records_scanned"] += 1
             
             # Check required fields
@@ -458,19 +454,42 @@ def data_integrity_checks(namespace: str, set_name: str,
                                 "issue": "Missing or empty required field"
                             })
             
-            # Check for invalid values (e.g., negative numbers where positive expected)
-            if required_fields:
-                for field in required_fields:
-                    if field in bins and isinstance(bins[field], (int, float)):
-                        if bins[field] < 0 and field.endswith(("_count", "_id", "_size", "_amount", "age")):
-                            invalid_counts[field] += 1
-                            if invalid_counts[field] <= 5:
-                                results["invalid_field_values"].append({
-                                    "key": key,
-                                    "field": field,
-                                    "value": bins[field],
-                                    "issue": "Potentially invalid negative value"
-                                })
+            # Check for invalid values.
+            #
+            # These used to be validated only for fields listed in
+            # `required_fields`, which are `name`/`status` - always strings.
+            # The negative-number branch therefore could never fire, and the
+            # corruption scenarios write `count: -10` and
+            # `email: not-an-email`, neither of which is a required field, so
+            # injected data corruption was reported as "no integrity issues".
+            # Scan every bin instead.
+            for field, value in bins.items():
+                if field.startswith("_") or isinstance(value, bool):
+                    continue
+                if isinstance(value, (int, float)) and value < 0:
+                    invalid_counts[field] = invalid_counts.get(field, 0) + 1
+                    if invalid_counts[field] <= 5:
+                        results["invalid_field_values"].append({
+                            "key": key,
+                            "field": field,
+                            "value": value,
+                            "issue": "Negative value where a magnitude is expected",
+                        })
+                elif (
+                    isinstance(value, str)
+                    and ("email" in field.lower() or "@" in value)
+                    and "@" in value
+                ):
+                    local, _, domain = value.partition("@")
+                    if not local or "." not in domain or " " in value:
+                        invalid_counts[field] = invalid_counts.get(field, 0) + 1
+                        if invalid_counts[field] <= 5:
+                            results["invalid_field_values"].append({
+                                "key": key,
+                                "field": field,
+                                "value": value,
+                                "issue": "Malformed email address",
+                            })
             
             # Check unique fields for duplicates
             if unique_fields:

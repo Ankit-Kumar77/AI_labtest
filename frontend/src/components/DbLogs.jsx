@@ -45,10 +45,10 @@ function renderLines(lines) {
 
 /**
  * Shared database log viewer: live `kubectl logs` tail + Elasticsearch
- * history for a K8s database pod. `target` is "yugabyte" | "aerospike";
+ * history for a K8s database pod. `podHint` locates the pod;
  * `fetchLive` / `fetchHistory` are the matching dbInvestigationApi fns.
  */
-export default function DbLogs({ target, podHint, fetchLive, fetchHistory }) {
+export default function DbLogs({ podHint, fetchLive, fetchHistory }) {
   const [tab, setTab] = useState("live");
   const [tail, setTail] = useState(200);
   const [previous, setPrevious] = useState(false);

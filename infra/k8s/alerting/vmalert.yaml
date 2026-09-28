@@ -1,0 +1,201 @@
+# GENERATED FILE - do not edit by hand.
+# Source:     alert-rules.yaml (rule structure)
+# Thresholds: thresholds.env    (every tunable value)
+# Regenerate: python3 infra/k8s/alerting/render.py
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensre-alert-rules
+  namespace: observability
+data:
+  alert-rules.yaml: |
+    groups:
+      - name: opensre-rules
+        interval: 30s
+        rules:
+          # High p99 request latency on instrumented app pods.
+          # http_request_duration_highr_seconds_bucket is scraped by vmagent
+          # (job="kubernetes-pods") from pods annotated prometheus.io/scrape.
+          # NOTE: the `le` label MUST survive the aggregation or
+          # histogram_quantile returns nothing.
+          - alert: HighLatency
+            expr: |
+              histogram_quantile(
+                0.99,
+                sum by (namespace, pod, le) (
+                  rate(http_request_duration_highr_seconds_bucket{job="kubernetes-pods"}[2m])
+                )
+              ) > 2
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High p99 latency for {{ $labels.pod }} ({{ $labels.namespace }})"
+              description: "p99 request latency has been above 2s for more than 1m."
+
+          - alert: CriticalLatency
+            expr: |
+              histogram_quantile(
+                0.99,
+                sum by (namespace, pod, le) (
+                  rate(http_request_duration_highr_seconds_bucket{job="kubernetes-pods"}[2m])
+                )
+              ) > 10
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Critical p99 latency for {{ $labels.pod }} ({{ $labels.namespace }})"
+              description: "p99 request latency has been above 10s for more than 2m."
+
+          # High 5xx error ratio (guard against dividing by zero with `or`).
+          - alert: HighErrorRate
+            expr: |
+              (
+                sum by (namespace, pod) (rate(http_requests_total{job="kubernetes-pods", status=~"5.."}[2m]))
+                /
+                clamp_min(sum by (namespace, pod) (rate(http_requests_total{job="kubernetes-pods"}[2m])), 0.001)
+              ) > 0.05
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High 5xx error rate for {{ $labels.pod }} ({{ $labels.namespace }})"
+              description: "More than 5% of requests are returning 5xx for over 2m."
+
+          # CPU throttling: cgroup throttled seconds climbing.
+          - alert: HighCPU
+            expr: |
+              (
+                sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_seconds_total[5m]))
+                /
+                clamp_min(sum by (namespace, pod, container) (rate(container_cpu_cfs_periods_total[5m])), 0.001)
+              ) > 0.5
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "CPU throttling on {{ $labels.container }} ({{ $labels.pod }})"
+              description: "Container is being CPU-throttled more than 50% of the time."
+
+          # Working-set memory as a share of the cgroup limit.
+          # Demo app pods are best-effort QoS, so their limit series are 0 --
+          # filter those out (> 0) and only score containers that really have a
+          # limit, otherwise the ratio explodes to the raw byte count.
+          - alert: HighMemory
+            expr: |
+              (
+                sum by (namespace, pod, container) (container_memory_working_set_bytes)
+                /
+                max by (namespace, pod, container) (
+                  container_spec_memory_limit_bytes{namespace="opensre"} > 0
+                )
+              ) > 0.9
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage for {{ $labels.container }} ({{ $labels.pod }})"
+              description: "Container working set is above 90% of its memory limit."
+
+          # Backstop for limitless (best-effort) containers.
+          - alert: HighMemoryAbsolute
+            expr: |
+              sum by (namespace, pod, container) (
+                container_memory_working_set_bytes{namespace="opensre"}
+              ) > 268435456
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "High memory usage for {{ $labels.container }} ({{ $labels.pod }})"
+              description: "Container working set is above 256MiB."
+
+          # Restart loop detected from kube-state-metrics.
+          - alert: PodRestart
+            expr: |
+              increase(kube_pod_container_status_restarts_total[10m]) > 3
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Pod {{ $labels.pod }} is restarting repeatedly"
+              description: "{{ $labels.container }} has restarted more than 3 times in the last 10 minutes."
+
+          # CrashLoopBackOff / non-ready container detected from kube-state-metrics.
+          - alert: ContainerNotReady
+            expr: |
+              max by (namespace, pod, container) (
+                kube_pod_container_status_ready{namespace=~"opensre|databases|observability"} == 0
+              ) > 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Container {{ $labels.container }} in {{ $labels.pod }} is not ready"
+              description: "Container has been unready for more than 2m."
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmalert
+  namespace: observability
+  labels:
+    app: vmalert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vmalert
+  template:
+    metadata:
+      labels:
+        app: vmalert
+    spec:
+      containers:
+        - name: vmalert
+          image: victoriametrics/vmalert:v1.150.0
+          args:
+            # Query the EXISTING vmsingle where vmagent already remote-writes.
+            - -datasource.url=http://victoriametrics-victoria-metrics-single-server.observability.svc.cluster.local:8428
+            - -notifier.url=http://alertmanager.observability.svc.cluster.local:9093
+            - -rule=/etc/vmalert/rules/*.yaml
+            - -evaluationInterval=30s
+            # Tag alerts with their origin so the webhook can tell vmalert
+            # traffic apart from anything else pointed at the backend.
+            - -external.label=source=vmalert
+            - -external.label=cluster=opensre-demo
+          ports:
+            - name: http
+              containerPort: 8880
+          volumeMounts:
+            - name: rules
+              mountPath: /etc/vmalert/rules
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: rules
+          configMap:
+            name: opensre-alert-rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmalert
+  namespace: observability
+  labels:
+    app: vmalert
+spec:
+  selector:
+    app: vmalert
+  ports:
+    - name: http
+      port: 8880
+      targetPort: 8880
+  type: ClusterIP

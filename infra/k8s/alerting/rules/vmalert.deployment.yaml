@@ -1,0 +1,63 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vmalert
+  namespace: observability
+  labels:
+    app: vmalert
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vmalert
+  template:
+    metadata:
+      labels:
+        app: vmalert
+    spec:
+      containers:
+        - name: vmalert
+          image: victoriametrics/vmalert:v1.150.0
+          args:
+            # Query the EXISTING vmsingle where vmagent already remote-writes.
+            - -datasource.url=http://victoriametrics-victoria-metrics-single-server.observability.svc.cluster.local:8428
+            - -notifier.url=http://alertmanager.observability.svc.cluster.local:9093
+            - -rule=/etc/vmalert/rules/*.yaml
+            - -evaluationInterval=30s
+            # Tag alerts with their origin so the webhook can tell vmalert
+            # traffic apart from anything else pointed at the backend.
+            - -external.label=source=vmalert
+            - -external.label=cluster=opensre-demo
+          ports:
+            - name: http
+              containerPort: 8880
+          volumeMounts:
+            - name: rules
+              mountPath: /etc/vmalert/rules
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: rules
+          configMap:
+            name: opensre-alert-rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vmalert
+  namespace: observability
+  labels:
+    app: vmalert
+spec:
+  selector:
+    app: vmalert
+  ports:
+    - name: http
+      port: 8880
+      targetPort: 8880
+  type: ClusterIP

@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Query, HTTPException
 from pydantic import BaseModel
 
-from app.services import db_investigation
 from app.services import investigation
 from app.services import opensre_cli
 from app.services import yugabyte
@@ -183,10 +182,16 @@ def opensre_investigate_yugabyte():
         "Investigate this YugabyteDB database for any issues. "
         "Check cluster health, connections, slow queries, errors, schema, "
         "data integrity, and replication status. "
-        "Provide root cause, confidence, evidence, timeline, and remediation."
+        "Provide root cause, confidence, evidence, timeline, and remediation. "
+        "If every check passes, report the database as healthy."
     )
 
-    return opensre_cli.investigate(evidence)
+    # The CLI can only ground on the payload it is handed, and a raw probe
+    # blob is not alert-shaped, so the run collapsed into the parser's
+    # generic "Unable to determine root cause" - even for a healthy database.
+    return opensre_cli.investigate(
+        investigation.database_alert_payload(evidence, "yugabyte", "yugabytedb-0")
+    )
 
 
 @router.get("/opensre/investigate/aerospike")
@@ -202,10 +207,14 @@ def opensre_investigate_aerospike():
         "Investigate this Aerospike database for any issues. "
         "Check cluster health, namespaces, operation errors, latency, "
         "and data integrity. "
-        "Provide root cause, confidence, evidence, timeline, and remediation."
+        "Provide root cause, confidence, evidence, timeline, and remediation. "
+        "If every check passes, report the database as healthy - an empty "
+        "database is not itself a fault."
     )
 
-    return opensre_cli.investigate(evidence)
+    return opensre_cli.investigate(
+        investigation.database_alert_payload(evidence, "aerospike", "aerospike-0")
+    )
 
 
 @router.get("/opensre/investigate/all")

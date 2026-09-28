@@ -2,9 +2,13 @@
 *.env
 *.env.local
 opensre-backend/.env
+# Alert thresholds are config, not credentials: the vmalert generator fails
+# without this file, so it must stay tracked.
+!infra/k8s/alerting/rules/thresholds.env
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 node_modules/
 dist/
 .venv/

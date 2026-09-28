@@ -1,5 +1,9 @@
 import copy
 import json
+import os
+import re
+import threading
+import time
 
 from app.core.config import settings
 from app.services import grounding, incident_history
@@ -51,6 +55,103 @@ def onboard():
             "onboard",
         ]
     )
+
+
+import threading
+
+
+# One agent run at a time. The default LLM provider is on a free tier that
+# rejects overlapping in-flight requests (HTTP 402); serialising here keeps a
+# burst of simultaneous alerts from starving the provider.
+_LLM_CONCURRENCY = int(os.getenv("OPENSRE_MAX_CONCURRENT_INVESTIGATIONS", "1"))
+_llm_slots = threading.BoundedSemaphore(max(1, _LLM_CONCURRENCY))
+
+
+def _llm_semaphore():
+    return _llm_slots
+
+
+def _is_transient(result: dict) -> bool:
+    """True when the CLI failed for a reason a retry can plausibly fix.
+
+    Provider-side hiccups (rate limits, upstream 5xx, the agent's structured
+    diagnosis failing to parse) surface as a non-zero exit with no usable
+    RCA. Retrying those is worth it; retrying a quota exhaustion or a genuine
+    crash just wastes time, so those are deliberately excluded.
+    """
+    if result.get("returncode") == 0:
+        return False
+    text = ((result.get("stderr") or "") + "\n" + (result.get("stdout") or "")).lower()
+
+    # OpenRouter's free tier answers HTTP 402 with "...would exceed your
+    # available credits given your current in-flight requests. Retry after
+    # in-flight requests complete." That is a CONCURRENCY limit, not an empty
+    # balance (the key still has its full limit_remaining), so backing off and
+    # retrying genuinely fixes it. A 402 without that wording is a real
+    # balance problem and must not be retried.
+    if "402" in text and "in-flight" in text:
+        return True
+
+    if any(
+        marker in text
+        for marker in (
+            "credit exhaust",
+            "quota",
+            "resource_exhausted",
+            "error code: 429",
+            "error code: 402",
+            "insufficient credit",
+            "available credits",
+            "permission_denied",
+            "unregistered callers",
+            "unauthorized",
+            "invalid api key",
+        )
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "api request failed",
+            "structured diagnosis parse failed",
+            "rate limit",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "overloaded",
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "connection reset",
+            "connection aborted",
+        )
+    )
+
+
+def _run_opensre_with_retry(payload: dict, timeout: int = 600, attempts: int = 4):
+    """Run the agent, retrying only transient provider failures.
+
+    Runs are serialised through a semaphore: the OpenRouter free tier rejects
+    concurrent in-flight requests with HTTP 402, and the backend triggers one
+    investigation per firing alert, so several alerts firing at once used to
+    guarantee that failure.
+    """
+    delay = 5
+    with _llm_semaphore():
+        result = _run_opensre(payload, timeout=timeout)
+        for _attempt in range(1, attempts):
+            if not _is_transient(result):
+                return result
+            time.sleep(delay)
+            result = _run_opensre(payload, timeout=timeout)
+            # A free-tier 402 clears as in-flight requests drain, so allow a
+            # longer cool-off than a generic upstream blip needs.
+            delay = min(delay * 2, 60) if "in-flight" in (
+                (result.get("stderr") or "") + (result.get("stdout") or "")
+            ).lower() else min(delay * 2, 30)
+    return result
 
 
 def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
@@ -110,7 +211,7 @@ def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
         ),
     }
 
-    result = _run_opensre(payload, timeout=timeout)
+    result = _run_opensre_with_retry(payload, timeout=timeout)
 
     grounding_meta = {
         "target": context["target"],
@@ -128,7 +229,7 @@ def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
             # report converges to the evidence.
             for _attempt in range(3):
                 payload["correction_note"] = grounding.correction_instruction(flags)
-                corrected = _run_opensre(payload, timeout=timeout)
+                corrected = _run_opensre_with_retry(payload, timeout=timeout)
                 if corrected.get("returncode") != 0:
                     grounding_meta["flags"] = flags
                     grounding_meta["accurate"] = False
@@ -152,7 +253,35 @@ def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
 
     result["grounding"] = grounding_meta
 
-    if result.get("returncode") != 0:
+    # The CLI exits 0 even when it gives up, so a run that produced no root
+    # cause would otherwise be stored as a completed investigation and read as
+    # a real (and wrong) conclusion. Retry once, then fail it honestly.
+    if result.get("returncode") == 0 and _is_degenerate(result.get("stdout") or ""):
+        retry = _run_opensre_with_retry(payload, timeout=timeout)
+        if retry.get("returncode") == 0 and not _is_degenerate(
+            retry.get("stdout") or ""
+        ):
+            result = retry
+            grounding_meta["self_corrected"] = True
+            result["grounding"] = grounding_meta
+        else:
+            if retry.get("returncode") != 0:
+                failure = describe_failure(retry)
+                result["error"] = failure["error"]
+                result["hint"] = failure["hint"]
+            else:
+                result["error"] = (
+                    "OpenSRE finished without identifying a root cause "
+                    "(return code 0, no conclusion)."
+                )
+                result["hint"] = (
+                    "The agent ran but produced no root cause, usually a "
+                    "transient structured-output parse failure. Evidence was "
+                    "collected and is included here; re-run the investigation."
+                )
+            result["success"] = False
+
+    if result.get("returncode") != 0 and not result.get("error"):
         failure = describe_failure(result)
         result["error"] = failure["error"]
         result["hint"] = failure["hint"]
@@ -165,6 +294,45 @@ def investigate(alert: dict, source: str = "investigation", timeout: int = 600):
     return result
 
 
+_DEGENERATE_RCA = (
+    "unable to determine root cause",
+    "unable to determine the root cause",
+    "root cause: unknown",
+    "could not determine root cause",
+    "insufficient evidence to determine",
+)
+
+
+def _is_degenerate(rca: str) -> bool:
+    """True when the report has no real conclusion.
+
+    The agent exits 0 in these cases, so success has to be judged from the
+    report text, not the return code.
+    """
+    lowered = (rca or "").strip().lower()
+    if not lowered:
+        return True
+    return any(marker in lowered for marker in _DEGENERATE_RCA)
+
+
+def _llm_env():
+    """Provider env for the OpenSRE CLI subprocess.
+
+    Only the selected provider's credentials are forwarded, so a stale
+    GEMINI_API_KEY can't silently win over the configured provider.
+    """
+    provider = (settings.LLM_PROVIDER or "").strip().lower()
+    if provider == "openrouter":
+        return {
+            "LLM_PROVIDER": provider,
+            "OPENROUTER_API_KEY": settings.OPENROUTER_API_KEY,
+            "OPENROUTER_MODEL": settings.OPENROUTER_MODEL,
+        }
+    if provider == "gemini":
+        return {"LLM_PROVIDER": provider, "GEMINI_API_KEY": settings.GEMINI_API_KEY}
+    return {"LLM_PROVIDER": provider} if provider else {}
+
+
 def _run_opensre(alert: dict, timeout: int = 600):
     return run_command(
         [
@@ -174,6 +342,7 @@ def _run_opensre(alert: dict, timeout: int = 600):
             json.dumps(alert),
         ],
         timeout=timeout,
+        env_overrides=_llm_env(),
     )
 
 
@@ -191,19 +360,81 @@ def describe_failure(result: dict) -> dict:
         or "quota" in lowered
         or "resource_exhausted" in lowered
         or "error code: 429" in lowered
+        or "error code: 402" in lowered
+        or "insufficient credit" in lowered
+        or "available credits" in lowered
+        or "permission_denied" in lowered
+        or "unregistered callers" in lowered
     ):
+        provider = settings.LLM_PROVIDER or "unset"
+
+        if "402" in lowered or "insufficient credit" in lowered or "available credits" in lowered:
+            affordable = re.search(r"can only afford (\d+)", lowered)
+            requested = re.search(r"requested up to (\d+) tokens", lowered)
+            if affordable:
+                # Not an empty balance: the key holds credit, but not enough
+                # to cover ONE request of the size OpenSRE asks for. The only
+                # fix is on the provider side.
+                want = requested.group(1) if requested else "4096"
+                headline = (
+                    f"OpenSRE LLM provider '{provider}' refused a single "
+                    f"request: the key can afford only ~{affordable.group(1)} "
+                    f"output tokens but OpenSRE requests {want} (HTTP 402)."
+                )
+                remedy = (
+                    "This is a per-request ceiling, not a depleted balance, and "
+                    "OpenSRE's token limit is not configurable. Raise the "
+                    "provider key's total limit (OpenRouter: Settings -> API "
+                    "keys -> edit the key's limit, or add credits to the "
+                    "workspace) so one call can afford the full request, or "
+                    "switch LLM_PROVIDER to a key with a higher limit."
+                )
+            else:
+                headline = (
+                    f"OpenSRE LLM provider '{provider}' rejected the request: "
+                    "insufficient credits (HTTP 402)."
+                )
+                remedy = (
+                    "Top up the balance for this API key, or point LLM_PROVIDER "
+                    "at a provider with quota. An investigation makes several "
+                    "LLM calls, so the key needs enough credit to cover a full run."
+                )
+        elif "permission_denied" in lowered or "unregistered callers" in lowered:
+            headline = (
+                f"OpenSRE LLM provider '{provider}' rejected the API key "
+                "(HTTP 403 PERMISSION_DENIED)."
+            )
+            remedy = (
+                "The configured key is not valid for this provider/model. "
+                "Re-issue the key and update the opensre-backend-secrets "
+                "Secret."
+            )
+        else:
+            headline = (
+                f"OpenSRE LLM quota exhausted for provider '{provider}'"
+                + (
+                    " (the Gemini free tier allows only ~20 requests/day)"
+                    if provider == "gemini"
+                    else ""
+                )
+                + "."
+            )
+            remedy = (
+                "The backend defaults to OpenRouter (LLM_PROVIDER=openrouter) "
+                "because the Gemini free tier is too small for an "
+                "alert-driven pipeline. Check that OPENROUTER_API_KEY is set "
+                "and OPENROUTER_MODEL is a model your key can reach."
+            )
+
         return {
             "error": (
-                "OpenSRE LLM quota exhausted (Gemini free-tier allows "
-                "20 requests/day). Evidence was collected successfully — "
-                "only the AI summary failed."
+                headline
+                + " Evidence was collected successfully — only the AI "
+                "summary failed."
             ),
-            "hint": (
-                "Wait for the daily quota reset, or switch provider "
-                "(`opensre auth login openrouter` and set OPENROUTER_MODEL "
-                "to an available model, or change LLM_PROVIDER), then "
-                "re-run Investigate. The evidence in this response is "
-                "still valid for manual review."
+            "hint": remedy + (
+                " The evidence in this response is still valid for manual "
+                "review, and the alert lifecycle itself is unaffected."
             ),
         }
     if "nonetype" in lowered or "traceback" in lowered:

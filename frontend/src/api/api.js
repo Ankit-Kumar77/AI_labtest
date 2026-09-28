@@ -56,15 +56,6 @@ export const dbInvestigationApi = {
   dbScenarioDataIntegrityInsertInvalid: (target) => api.post("/demo/db-scenario/data-integrity/insert-invalid", { target }),
 };
 
-// CoreDNS health / evidence API (read-only)
-export const corednsApi = {
-  health: () => api.get("/coredns/health"),
-  probe: () => api.get("/coredns/probe"),
-  metrics: () => api.get("/coredns/metrics"),
-  evidence: () => api.get("/investigation/evidence/coredns"),
-  opensreInvestigate: () => api.get("/opensre/investigate/coredns"),
-};
-
 // CoreDNS Demo / Investigation API (controlled failure, reversible)
 export const corednsDemoApi = {
   modes: () => api.get("/demo/coredns/modes"),
@@ -105,6 +96,18 @@ export const incidentsApi = {
   get: (id) => api.get(`/incidents/${encodeURIComponent(id)}`),
   remove: (id) => api.delete(`/incidents/${encodeURIComponent(id)}`),
   clear: () => api.delete("/incidents"),
+};
+
+// Alert-driven incidents (fingerprint-deduplicated lifecycle, fed by the
+// in-cluster Alertmanager webhook). The live feed uses the SSE endpoint, so
+// the webhook URL is never exposed to the browser.
+export const alertsApi = {
+  list: (limit = 100) => api.get("/alerts", { params: { limit } }),
+  active: () => api.get("/alerts/active"),
+  get: (fingerprint) => api.get(`/alerts/${encodeURIComponent(fingerprint)}`),
+  clear: () => api.delete("/alerts"),
+  // Absolute URL because EventSource (not axios) opens the stream.
+  streamUrl: () => `${api.defaults.baseURL}/alerts/stream`,
 };
 
 export default api;

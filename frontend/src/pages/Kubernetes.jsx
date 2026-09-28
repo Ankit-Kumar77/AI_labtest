@@ -162,33 +162,6 @@ export default function Kubernetes() {
   }
 
   // --- Node failure demo handlers ---
-  const handleNodeFail = async () => {
-    setNodeDemoLoading(true);
-    setNodeDemoError(null);
-    setNodeDemoInvestigation(null);
-    setNodeDemoRecovery(null);
-    try {
-      const res = await api.post("/demo/node-failure/fail", {
-        node: "opensre-demo-worker",
-        context: "kind-opensre-demo",
-      });
-      if (res.data.success) {
-        setNodeDemoPhase("failed");
-        setNodeDemoFault(res.data.fault);
-        load().then(({ nodes: nl, pods: pl }) => {
-          setNodes(nl);
-          setPods(pl);
-        });
-      } else {
-        setNodeDemoError("Failed to inject fault");
-      }
-    } catch (e) {
-      setNodeDemoError(e.message);
-    } finally {
-      setNodeDemoLoading(false);
-    }
-  };
-
   const handleNodeRefail = async () => {
     setNodeDemoLoading(true);
     setNodeDemoError(null);

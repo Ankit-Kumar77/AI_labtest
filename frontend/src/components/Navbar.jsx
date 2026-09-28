@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
 import api from "../api/api";
 import { Menu } from "lucide-react";
+import AlertNotifications from "./AlertNotifications";
 
 const TITLES = [
   { path: "/", title: "Dashboard", subtitle: "Cluster overview" },
@@ -59,6 +60,8 @@ export default function Navbar({ onMenuClick }) {
       </div>
 
       <div className="navbar__spacer" />
+
+      <AlertNotifications />
 
       <span
         role="status"

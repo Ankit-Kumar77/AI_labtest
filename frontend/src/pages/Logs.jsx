@@ -3,7 +3,6 @@ import { elkApi } from "../api/api";
 import Card from "../components/Card";
 import Skeleton from "../components/Skeleton";
 import {
-  Search,
   Filter,
   X,
   ChevronDown,
@@ -363,6 +362,12 @@ export default function Logs() {
             {podsLoading && <span className="text-muted" style={{ fontSize: 11 }}>Loading…</span>}
             {podsError && <span className="text-danger" style={{ fontSize: 11 }}>{podsError}</span>}
           </div>
+
+          {facetsError && (
+            <div className="text-danger" style={{ fontSize: 11 }}>
+              Could not load log filters: {facetsError}
+            </div>
+          )}
 
           <div className="field" style={{ minWidth: 160 }}>
             <label htmlFor="logs-service">Service</label>

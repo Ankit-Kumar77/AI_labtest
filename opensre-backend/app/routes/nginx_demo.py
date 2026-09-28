@@ -287,11 +287,6 @@ def nginx_fail(request: DemoRequest):
         "ts": __import__("datetime").datetime.utcnow().isoformat() + "Z",
     }
     _save_state(state)
-    # also record to experiments events if helper exists
-    try:
-        from app.services import game_day  # reuse helper if available
-    except Exception:
-        pass
     return {
         "success": True,
         "scenario": "nginx-failure",

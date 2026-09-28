@@ -1,0 +1,221 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: opensre-backend
+  namespace: opensre
+---
+# The backend shells out to `kubectl` for the EXISTING evidence collectors
+# (containers.py, investigation.py, db_investigation.py), so it needs
+# read access to the workloads it investigates. Scoped to the namespaces
+# the demo actually observes; chaos write actions stay out of this binding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: opensre-backend-observer
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "endpoints", "configmaps", "nodes", "namespaces", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: opensre-backend-observer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: opensre-backend-observer
+subjects:
+  - kind: ServiceAccount
+    name: opensre-backend
+    namespace: opensre
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opensre-backend-config
+  namespace: opensre
+  labels:
+    app: opensre-backend
+data:
+  # In-cluster Service DNS for every dependency -- no localhost, because
+  # Alertmanager delivers to this Service and the pod has no port-forwards.
+  VICTORIA_METRICS_URL: http://victoriametrics-victoria-metrics-single-server.observability.svc.cluster.local:8428
+  GRAFANA_URL: http://grafana.observability.svc.cluster.local:80
+  ELASTICSEARCH_URL: http://opensre-es-master.observability.svc.cluster.local:9200
+  AEROSPIKE_HOSTS: aerospike.databases.svc.cluster.local:3000
+  AEROSPIKE_NAMESPACE: test
+  YUGABYTE_HOST: yugabytedb.databases.svc.cluster.local
+  YUGABYTE_PORT: "5433"
+  YUGABYTE_DATABASE: yugabyte
+  YUGABYTE_USER: yugabyte
+  YUGABYTE_PASSWORD: yugabyte
+  NGINX_NAMESPACE: opensre
+  NGINX_LABEL: app=nginx
+  COREDNS_NAMESPACE: kube-system
+  COREDNS_LABEL: k8s-app=kube-dns
+  ELASTICSEARCH_INDEX_PATTERN: logs-opensre-*
+  GITHUB_API_URL: https://api.github.com
+  # Slack is optional: leave unset to disable. Injected from a Secret
+  # (see opensre-backend-secrets.example.yaml), never committed.
+  SLACK_WEBHOOK_URL: ""
+  # LLM provider for the OpenSRE RCA agent. OpenRouter is the default
+  # because the Gemini free tier (~20 requests/day) cannot sustain an
+  # alert-driven pipeline. The API key comes from the Secret; only the
+  # non-secret provider + model live here.
+  LLM_PROVIDER: openrouter
+  OPENROUTER_MODEL: openai/gpt-4o-mini
+  # Investigations run one at a time. The OpenRouter free tier rejects
+  # overlapping in-flight requests (HTTP 402), and a burst of simultaneous
+  # firing alerts used to guarantee that failure. Raise only if the provider
+  # has the headroom.
+  OPENSRE_MAX_CONCURRENT_INVESTIGATIONS: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opensre-backend
+  namespace: opensre
+  labels:
+    app: opensre-backend
+spec:
+  replicas: 1
+  strategy:
+    # Singleton with file-backed alert/incident stores: avoid a surge pod,
+    # which cannot fit alongside the old one on this memory-tight worker.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: opensre-backend
+  template:
+    metadata:
+      labels:
+        app: opensre-backend
+    spec:
+      serviceAccountName: opensre-backend
+      containers:
+        - name: backend
+          image: localhost/opensre-backend:alert
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8001
+          envFrom:
+            - configMapRef:
+                name: opensre-backend-config
+          env:
+            # The RCA CLI needs an LLM key. Supplied via Secret (see
+            # secrets.example.yaml); never committed.
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
+            # LLM_PROVIDER deliberately comes from the ConfigMap, NOT the
+            # Secret: a secret-sourced value would silently override the
+            # ConfigMap default, which is how this once stayed pinned to the
+            # quota-exhausted Gemini.
+            - name: GEMINI_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: GEMINI_MODEL
+                  optional: true
+            - name: GEMINI_REASONING_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: GEMINI_REASONING_MODEL
+                  optional: true
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: GITHUB_TOKEN
+                  optional: true
+            - name: SLACK_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: SLACK_WEBHOOK_URL
+                  optional: true
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: opensre-backend-secrets
+                  key: OPENROUTER_API_KEY
+                  optional: true
+          # Incident/alert stores are file-backed; keep them off the image
+          # layer and on a volume so they survive restarts.
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 8001
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        # Alert + incident histories are file-backed. emptyDir would lose
+        # every incident on pod replacement, so back them with a PVC.
+        - name: data
+          persistentVolumeClaim:
+            claimName: opensre-backend-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensre-backend
+  namespace: opensre
+  labels:
+    app: opensre-backend
+  annotations:
+    # This is the address Alertmanager posts to:
+    # http://opensre-backend.opensre.svc.cluster.local:8001/api/alerts/alertmanager
+spec:
+  selector:
+    app: opensre-backend
+  ports:
+    - name: http
+      port: 8001
+      targetPort: 8001
+  type: ClusterIP
+---
+# Durable storage for the alert lifecycle store (alerts.jsonl) and the
+# incident archive (incidents.jsonl). Without this, every pod restart
+# erased the incident history the dashboard exists to show.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: opensre-backend-data
+  namespace: opensre
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # No storageClassName: use the Kind cluster's default class so this
+  # works on whatever provisioner the local cluster provides.

@@ -78,14 +78,6 @@ FOREIGN_TECH = [
     "keycloak", "jenkins", "nats", "dynamodb",
 ]
 
-HEALTHY_STATUSES = ("connected", "running", "healthy", "ok", "up", "ready")
-
-SIGNAL_SCOPES = ("health", "connection_status", "connections", "cluster_health",
-                 "latency", "latency_info", "namespace_info", "namespaces",
-                 "namespace_set_stats", "demo_set_stats", "operation_errors",
-                 "recent_errors", "slow_queries", "table_stats", "schema",
-                 "summary", "log_analysis")
-
 
 # ---------------------------------------------------------------------------
 # Signal extraction
@@ -390,23 +382,50 @@ def build_context(evidence: dict) -> dict:
 
     k8s = evidence.get("kubernetes")
     if isinstance(k8s, dict):
-        for src in (k8s.get("state"), k8s.get("pod_state")):
-            if isinstance(src, dict):
-                phase = src.get("phase") or src.get("status")
+        # Accept both the flattened shape (kubernetes.pod_state) and the
+        # wrapper shape (kubernetes.kubernetes.pod_state) so a payload built
+        # by either collector still grounds correctly.
+        nested = k8s.get("kubernetes")
+        sources = [k8s, nested if isinstance(nested, dict) else {}]
+        for scope in sources:
+            for src in (scope.get("state"), scope.get("pod_state")):
+                if isinstance(src, dict):
+                    phase = src.get("phase") or src.get("status")
+                    if phase:
+                        break
+            if phase:
+                break
+        if not phase:
+            for scope in sources:
+                pst = scope.get("pod_status")
+                if isinstance(pst, dict):
+                    phase = pst.get("phase")
+                elif isinstance(pst, str) and "running" in pst.lower():
+                    phase = "Running"
                 if phase:
                     break
-        if not phase:
-            pst = k8s.get("pod_status")
-            if isinstance(pst, dict):
-                phase = pst.get("phase")
-            elif isinstance(pst, str) and "running" in pst.lower():
-                phase = "Running"
         if isinstance(phase, str):
             phase = phase.lower()
             if phase not in ("running", "crashloopbackoff", "pending",
                              "succeeded", "terminated", "failed", "error",
                              "down", "unknown", "notdeployed", "not deployed"):
                 phase = None
+
+    # Fall back to the container's own runtime view when no pod phase was
+    # collected. For database targets this is often the only statement about
+    # whether the service is actually up.
+    if not phase:
+        container = evidence.get("container")
+        if isinstance(container, dict):
+            cstate = container.get("state")
+            if isinstance(cstate, dict) and cstate.get("success"):
+                if cstate.get("running"):
+                    phase = "running"
+                    healthy = True
+                else:
+                    cstatus = cstate.get("status")
+                    if isinstance(cstatus, str) and cstatus:
+                        phase = cstatus.lower()
 
     if target in (None, "target"):
         if isinstance(evidence.get("pod"), str):

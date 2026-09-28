@@ -63,7 +63,6 @@ Run these to confirm everything works:
 ## Files to Reference
 - `/home/subrata/Desktop/project/AI_labtest/guide for running` - detailed startup guide
 - `/home/subrata/Desktop/project/AI_labtest/README.md` - full documentation
-- `/home/subrata/Desktop/project/AI_labtest/docker-compose.yml` - local databases
 - `/home/subrata/Desktop/project/AI_labtest/observability/install.sh` - full stack installer
 - `/home/subrata/Desktop/project/AI_labtest/infra/kind/kind-config.yaml` - Kind cluster config
 
@@ -117,8 +116,9 @@ Kibana: http://localhost:5601
 - **ES has no `k8s_node_name` field** — node-level log evidence is aggregated
   per-namespace/per-degraded-pod, so pods must have ES logs flowing for the
   `es_signals` block to populate.
-- **In-cluster ES only**: keep `docker-compose.yml` ES (port 9200) DOWN; the
-  backend talks to `opensre-es-master` via
+- **In-cluster ES only**: the backend talks to `opensre-es-master` in the
+  `observability` namespace; nothing needs to be kept DOWN on the host, since
+  there is no compose file any more. Expose it with
   `kubectl port-forward -n observability svc/es-external 9200:9200`.
 - **Model quota**: the OpenSRE CLI uses the Gemini free tier
   (e.g. 20 requests/day per model + per-minute token caps). One investigation
