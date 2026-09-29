@@ -110,4 +110,23 @@ export const alertsApi = {
   streamUrl: () => `${api.defaults.baseURL}/alerts/stream`,
 };
 
+// Alertmanager's own state (health, routing config, alerts, silences)
+// plus the two controls that make the alerting chain demonstrable:
+// `sync` pulls current alert state into the incident store, and
+// `testAlert` injects a synthetic alert through Alertmanager's real
+// routing path so the whole vmalert -> Alertmanager -> incident -> RCA
+// chain can be shown on demand.
+export const alertmanagerApi = {
+  overview: () => api.get("/alertmanager/overview"),
+  health: () => api.get("/alertmanager/health"),
+  status: () => api.get("/alertmanager/status"),
+  alerts: () => api.get("/alertmanager/alerts"),
+  silences: () => api.get("/alertmanager/silences"),
+  logs: (tail = 150) => api.get("/alertmanager/logs", { params: { tail } }),
+  reports: (limit = 50) => api.get("/alertmanager/reports", { params: { limit } }),
+  sync: () => api.post("/alertmanager/sync"),
+  testAlert: (name, severity) =>
+    api.post("/alertmanager/test-alert", null, { params: { name, severity } }),
+};
+
 export default api;

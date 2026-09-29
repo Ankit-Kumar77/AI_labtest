@@ -14,6 +14,7 @@ import Settings from "./pages/Settings";
 import GitHub from "./pages/GitHub";
 import Chaos from "./pages/Chaos";
 import Logs from "./pages/Logs";
+import Alerting from "./pages/Alerting";
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
         <Route path="/kubernetes" element={<Kubernetes />} />
         <Route path="/metrics" element={<Metrics />} />
         <Route path="/latency" element={<Latency />} />
+        <Route path="/alerting" element={<Alerting />} />
         <Route path="/logs" element={<Logs />} />
         <Route path="/aerospike" element={<Aerospike />} />
         <Route path="/yugabyte" element={<Yugabyte />} />

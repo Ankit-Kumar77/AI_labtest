@@ -14,9 +14,27 @@ from datetime import datetime, timezone
 
 MAX_QUEUE = 100
 
+# Set during app shutdown so long-lived SSE generators return instead of
+# holding the connection open. Without this, `uvicorn --reload` waits
+# forever for the alert stream to drain and the backend never restarts.
+_shutting_down = threading.Event()
+
 _lock = threading.Lock()
 _subscribers: set[asyncio.Queue] = set()
 _recent: deque = deque(maxlen=20)
+
+
+def is_shutting_down() -> bool:
+    return _shutting_down.is_set()
+
+
+def begin_shutdown() -> None:
+    _shutting_down.set()
+
+
+def reset_shutdown() -> None:
+    """Clear the flag so a reloaded process can serve streams again."""
+    _shutting_down.clear()
 
 
 def _now() -> str:

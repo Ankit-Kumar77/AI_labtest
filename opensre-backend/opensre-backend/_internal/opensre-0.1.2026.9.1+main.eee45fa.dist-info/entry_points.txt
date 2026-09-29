@@ -1,0 +1,2 @@
+[console_scripts]
+opensre = surfaces.entrypoint:main

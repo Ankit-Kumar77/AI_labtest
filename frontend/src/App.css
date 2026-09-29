@@ -397,6 +397,10 @@
   margin-bottom: var(--space-6);
 }
 
+.stat-grid--4 {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
 .stat-card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -451,6 +455,7 @@
   margin-top: var(--space-3);
   font-size: var(--fs-xs);
   color: var(--text-3);
+  overflow-wrap: anywhere;
 }
 
 /* ---------- Badges ---------- */
@@ -1019,6 +1024,12 @@
   background: var(--success-soft);
   border-color: rgba(18, 128, 92, 0.3);
   color: var(--success);
+}
+
+.alert--warning {
+  background: var(--warning-soft);
+  border-color: rgba(180, 120, 10, 0.3);
+  color: var(--warning);
 }
 
 /* ---------- Metric grid variants ---------- */

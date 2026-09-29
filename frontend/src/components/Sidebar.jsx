@@ -13,6 +13,7 @@ import {
   GitBranch,
   Zap,
   Gauge,
+  BellRing,
   Database as DatabaseIcon,
 } from "lucide-react";
 
@@ -24,6 +25,7 @@ const NAV = [
       { to: "/kubernetes", label: "Kubernetes", icon: Container },
       { to: "/metrics", label: "Metrics", icon: Activity },
       { to: "/latency", label: "Latency", icon: Gauge },
+      { to: "/alerting", label: "Alerting", icon: BellRing },
       { to: "/logs", label: "Logs", icon: DatabaseIcon },
     ],
   },

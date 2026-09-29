@@ -12,11 +12,14 @@ point-in-time snapshots). Records are pruned to MAX_RECORDS.
 """
 
 import json
+import os
 import re
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from app.services import alert_store
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
@@ -161,39 +164,62 @@ def _save(payload: dict, cli_result: dict, source: str) -> dict:
         "success": bool((cli_result or {}).get("success")),
         "returncode": (cli_result or {}).get("returncode"),
         "report": _summarize_report(report),
+        "error": (cli_result or {}).get("error") or None,
+        "hint": (cli_result or {}).get("hint") or None,
         "stdout": stdout[-MAX_STDOUT_CHARS:],
         "stderr": stderr[-MAX_STDERR_CHARS:] or None,
     }
 
+    # Alert-driven investigations reuse the alert's stable identity so the
+    # dashboard can show ONE saved report per firing alert (the same alert
+    # fires repeatedly and retries its RCA, but that is one lifecycle).
+    if source == "alert":
+        labels = (payload or {}).get("labels") or {}
+        record["alertname"] = labels.get("alertname") or (payload or {}).get("alertname") or info["target_label"]
+        record["severity"] = labels.get("severity") or "warning"
+        record["pod"] = record["pod"] or labels.get("pod") or (payload or {}).get("pod") or None
+        record["fingerprint"] = alert_store.compute_fingerprint(payload)
+
     with _lock:
         try:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
-            with STORE_PATH.open("a") as handle:
-                handle.write(json.dumps(record) + "\n")
-            _prune_locked()
+            records = _read_all()
+            if source == "alert" and record.get("fingerprint"):
+                replaced = False
+                for index, existing in enumerate(records):
+                    if (
+                        existing.get("source") == "alert"
+                        and existing.get("fingerprint") == record["fingerprint"]
+                    ):
+                        # Keep the original id so deep links to this report
+                        # (`/incident?report=<id>`) stay stable across retries.
+                        record["id"] = existing.get("id") or record["id"]
+                        records[index] = record
+                        replaced = True
+                        break
+                if not replaced:
+                    records.append(record)
+            else:
+                records.append(record)
+            _write_all(_prune_locked(records))
         except OSError:
             pass
     return _to_summary(record)
 
 
-def _prune_locked() -> None:
-    """Keep only the newest MAX_RECORDS lines (caller holds _lock)."""
-    try:
-        with STORE_PATH.open() as handle:
-            lines = [ln for ln in handle if ln.strip()]
-    except FileNotFoundError:
-        return
-    except OSError:
-        return
-    if len(lines) <= MAX_RECORDS:
-        return
+def _write_all(records: list) -> None:
+    """Rewrite the store atomically (caller may hold _lock)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = STORE_PATH.with_suffix(".tmp")
-    try:
-        with tmp.open("w") as handle:
-            handle.writelines(lines[-MAX_RECORDS:])
-        tmp.replace(STORE_PATH)
-    except OSError:
-        pass
+    with tmp.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+    os.replace(tmp, STORE_PATH)
+
+
+def _prune_locked(records: list) -> list:
+    """Keep only the newest MAX_RECORDS (caller holds _lock)."""
+    return records[-MAX_RECORDS:]
 
 
 def _read_all() -> list:
@@ -229,6 +255,11 @@ def _to_summary(record: dict) -> dict:
         "question": record.get("question"),
         "success": record.get("success"),
         "report": record.get("report") or {},
+        "error": record.get("error"),
+        "hint": record.get("hint"),
+        "alertname": record.get("alertname"),
+        "severity": record.get("severity"),
+        "fingerprint": record.get("fingerprint"),
         "stdout_preview": stdout[:800],
     }
 
@@ -257,10 +288,7 @@ def delete_incident(incident_id: str) -> dict:
         if len(kept) == len(records):
             return {"success": False, "error": f"Incident '{incident_id}' not found"}
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            with STORE_PATH.open("w") as handle:
-                for record in kept:
-                    handle.write(json.dumps(record) + "\n")
+            _write_all(kept)
         except OSError as exc:
             return {"success": False, "error": str(exc)}
     return {"success": True, "id": incident_id}

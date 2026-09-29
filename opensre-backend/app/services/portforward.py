@@ -22,6 +22,16 @@ FORWARDS = {
     # target -> namespace / service / pod / localhost port / service port
     "yugabyte": {"namespace": "databases", "svc": "yugabytedb", "pod": "yugabytedb-0", "local": 5433, "remote": 5433},
     "aerospike": {"namespace": "databases", "svc": "aerospike", "pod": "aerospike-0", "local": 3001, "remote": 3000},
+    # Alertmanager is a Deployment, so the pod name carries a random suffix
+    # and is resolved by label selector at forward time.
+    "alertmanager": {
+        "namespace": "observability",
+        "svc": "alertmanager",
+        "pod": None,
+        "selector": "app=alertmanager",
+        "local": 9093,
+        "remote": 9093,
+    },
 }
 
 # yugabyte is also addressed as yugabytedb in some paths
@@ -87,6 +97,28 @@ def _forward_pids(target: str) -> list:
         return []
 
 
+def _resolve_selector_pod(cfg: dict) -> str | None:
+    """Current pod name for a Deployment-backed target, by label selector."""
+    selector = cfg.get("selector")
+    if not selector:
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "kubectl", "get", "pods",
+                "-n", cfg["namespace"],
+                "-l", selector,
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        return (proc.stdout or "").strip() or None
+    except Exception:
+        return None
+
+
 def _proc_start_epoch(pid: int) -> float | None:
     """When a process started (epoch seconds), via /proc stat field 22."""
     try:
@@ -118,9 +150,16 @@ def _pod_start_epoch(target: str) -> float | None:
 
     try:
         cfg = FORWARDS[_resolve(target)]
+        name = cfg.get("pod")
+        if not name:
+            # Deployment-backed service: the pod name carries a random
+            # suffix, so resolve the current one by label selector.
+            name = _resolve_selector_pod(cfg)
+            if not name:
+                return None
         proc = subprocess.run(
             [
-                "kubectl", "get", "pod", cfg["pod"],
+                "kubectl", "get", "pod", name,
                 "-n", cfg["namespace"], "-o",
                 "jsonpath={.status.startTime}",
             ],

@@ -7,6 +7,8 @@ LLM.
 """
 
 import json
+import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -83,6 +85,198 @@ def isolated_store(tmp_path, monkeypatch):
 
 def post(alerts, **extra):
     return client.post("/api/alerts/alertmanager", json={"alerts": alerts, **extra})
+
+
+# --------------------------------------------------------------------------
+# Stale state recovery
+#
+# Alertmanager is the only source of truth for whether an alert is firing,
+# and it re-fires every `repeat_interval`. When a `resolved` webhook is
+# missed (backend down, or Alertmanager restarting and losing state) the
+# record would otherwise stay `firing` forever, and a process that died
+# mid-investigation would leave `pending` owned by a thread that no longer
+# exists. These tests pin that reconciliation.
+# --------------------------------------------------------------------------
+
+def _age(record: dict, seconds: float) -> None:
+    """Backdate a record's last_seen so it looks `seconds` stale."""
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat()
+    records = alert_store._read_all()
+    for stored in records:
+        if stored.get("fingerprint") == record["fingerprint"]:
+            stored["last_seen"] = stamp
+    # Write the list we just mutated -- a second _read_all() would return
+    # a fresh, unmodified copy and silently discard the backdating.
+    alert_store._write_all(records)
+
+
+def test_stale_firing_alert_is_auto_resolved():
+    """A firing alert Alertmanager stopped re-sending must not linger."""
+    record, _ = alert_store.upsert(FIRING)
+    assert alert_store.active_alerts()["count"] == 1
+
+    _age(record, alert_store.STALE_FIRING_SECONDS + 1)
+    reaped = alert_store.reap_stale_firing()
+
+    assert [r["fingerprint"] for r in reaped] == [record["fingerprint"]]
+    assert alert_store.active_alerts()["count"] == 0
+    assert alert_store.get_alert(record["fingerprint"])["status"] == "resolved"
+
+
+def test_recent_firing_alert_is_left_alone():
+    """Inside the repeat window, silence is not staleness."""
+    record, _ = alert_store.upsert(FIRING)
+    _age(record, alert_store.STALE_FIRING_SECONDS - 30)
+
+    assert alert_store.reap_stale_firing() == []
+    assert alert_store.active_alerts()["count"] == 1
+
+
+def test_refreshed_firing_alert_does_not_go_stale():
+    """A repeat firing resets the clock, so an alert firing for hours stays up."""
+    record, _ = alert_store.upsert(FIRING)
+    _age(record, alert_store.STALE_FIRING_SECONDS + 1)
+
+    # Alertmanager re-fires the same fingerprint: upsert must refresh last_seen.
+    refreshed, created = alert_store.upsert(FIRING)
+    assert created is False
+    assert refreshed["notification_count"] == 2
+
+    assert alert_store.reap_stale_firing() == []
+    assert alert_store.active_alerts()["count"] == 1
+
+
+def test_already_resolved_alert_is_not_reaped():
+    record, _ = alert_store.upsert(FIRING)
+    alert_store.upsert(RESOLVED)
+    _age(record, alert_store.STALE_FIRING_SECONDS + 1)
+
+    assert alert_store.reap_stale_firing() == []
+
+
+def test_unparseable_timestamp_is_not_treated_as_stale():
+    record, _ = alert_store.upsert(FIRING)
+    records = alert_store._read_all()
+    for stored in records:
+        stored["last_seen"] = "not-a-timestamp"
+    alert_store._write_all(records)
+
+    # Sanity-check the corruption actually landed, or this asserts nothing.
+    assert alert_store.get_alert(record["fingerprint"])["last_seen"] == "not-a-timestamp"
+    assert alert_store.reap_stale_firing() == []
+    assert alert_store.active_alerts()["count"] == 1
+
+
+def test_orphaned_pending_investigation_becomes_interrupted():
+    """A `pending` record has no live worker after a restart."""
+    record, _ = alert_store.upsert(FIRING)
+    assert alert_store.get_alert(record["fingerprint"])["investigation_status"] == "pending"
+
+    reaped = alert_store.recover_orphaned_investigations()
+
+    assert [r["fingerprint"] for r in reaped] == [record["fingerprint"]]
+    stored = alert_store.get_alert(record["fingerprint"])
+    assert stored["investigation_status"] == "interrupted"
+    assert "interrupted" in stored["investigation"]["error"]
+
+
+def test_finished_investigations_are_not_marked_interrupted():
+    record, _ = alert_store.upsert(FIRING)
+    alert_store.update_investigation(record["fingerprint"], {"success": True, "report": {}})
+
+    assert alert_store.recover_orphaned_investigations() == []
+    assert alert_store.get_alert(record["fingerprint"])["investigation_status"] == "resolved"
+
+
+def test_failed_investigation_is_retried_on_repeat_firing(isolated_store, monkeypatch):
+    """A failed RCA must not be permanent -- a later repeat should retry it."""
+    monkeypatch.setattr(
+        opensre_cli, "investigate",
+        lambda alert, source="alert": {"success": False, "error": "quota exhausted"},
+    )
+
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+    fingerprint = post([FIRING]).json()["results"][0]["fingerprint"]
+    assert alert_store.get_alert(fingerprint)["investigation_status"] == "failed"
+
+    # Quota recovers; the next repeat firing should retry.
+    monkeypatch.setattr(
+        opensre_cli, "investigate",
+        lambda alert, source="alert": {"success": True, "report": {"summary": "recovered"}},
+    )
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+
+    assert alert_store.get_alert(fingerprint)["investigation_status"] == "resolved"
+
+
+def test_successful_investigation_is_not_repeated(isolated_store):
+    """Retrying a good RCA on every repeat would burn quota in a loop."""
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+    before = len(isolated_store["triggered"])
+
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+
+    assert len(isolated_store["triggered"]) == before
+
+
+def test_repeat_firing_does_not_queue_duplicate_investigation(isolated_store, monkeypatch):
+    """A repeat that lands while an RCA is in flight must not queue a second.
+
+    The per-fingerprint lock only serialises runs -- it does not skip them --
+    so without an in-flight claim, a slow provider plus a fast poll would
+    queue one full investigation per poll behind the running one.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def blocking_investigate(alert, source="alert"):
+        calls.append(alert)
+        entered.set()
+        assert release.wait(timeout=15), "gate never released"
+        return {"success": True, "report": {"summary": "mock RCA"}}
+
+    monkeypatch.setattr(opensre_cli, "investigate", blocking_investigate)
+
+    post([FIRING])
+    assert entered.wait(timeout=10), "first investigation never started"
+
+    # A repeat landing mid-run is deduped into the same lifecycle and would
+    # qualify for a retry (pending is retryable) -- but the worker is already
+    # in flight, so no second run may be queued behind it.
+    assert post([FIRING]).json()["results"][0]["status"] == "firing"
+    assert post([FIRING]).json()["results"][0]["status"] == "firing"
+
+    release.set()
+    alerts.wait_for_investigations(timeout=10)
+
+    assert len(calls) == 1
+
+
+def test_slack_is_not_notified_twice_for_one_lifecycle(isolated_store):
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+    post([FIRING])
+    alerts.wait_for_investigations(timeout=10)
+
+    firing_calls = [c for c in isolated_store["slack"] if c[0] == "firing"]
+    assert len(firing_calls) == 1
+
+
+def test_reaper_clears_phantoms_seen_at_startup():
+    """Startup sweep repairs a store left mid-lifecycle by a restart."""
+    record, _ = alert_store.upsert(FIRING)
+    _age(record, alert_store.STALE_FIRING_SECONDS + 1)
+
+    from app.main import _reap_alert_state
+
+    _reap_alert_state()
+
+    assert alert_store.active_alerts()["count"] == 0
 
 
 # --------------------------------------------------------------------------

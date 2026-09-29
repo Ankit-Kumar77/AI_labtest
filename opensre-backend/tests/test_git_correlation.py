@@ -15,15 +15,23 @@ def test_correlate_without_incident_returns_newest():
 
 def test_correlate_with_incident_finds_prior_commit():
     """With an incident time, suspected should be newest commit at-or-before it."""
-    result = correlate_commits(
-        incident_start="2026-09-01T12:43:00Z",
-        limit=10,
-    )
+    # Derived from the live remote so the test survives as history grows:
+    # a hardcoded incident time eventually falls outside the fetched window.
+    baseline = correlate_commits(incident_start=None, limit=10)
+    if not baseline.get("success"):
+        return
+    commits = baseline.get("recent_commits") or []
+    if len(commits) < 2:
+        return
+    second = commits[1]
+    result = correlate_commits(incident_start=second["date"], limit=10)
     if not result.get("success"):
         return
     suspected = result.get("suspected_commit")
     assert suspected is not None
-    assert suspected["sha"] == "509be860b47bd15533c72d598903a65205884e58"
+    # The newest commit is AFTER the incident window, so the first at-or-before
+    # it must be the second commit we used as the boundary.
+    assert suspected["sha"] == second["sha"]
 
 
 def test_correlate_with_early_incident_returns_no_commit_found():
@@ -39,8 +47,14 @@ def test_correlate_with_early_incident_returns_no_commit_found():
 
 
 def test_correlate_with_branch_param():
+    baseline = correlate_commits(incident_start=None, branch="connectors", limit=10)
+    if not baseline.get("success"):
+        return
+    commits = baseline.get("recent_commits") or []
+    if len(commits) < 2:
+        return
     result = correlate_commits(
-        incident_start="2026-09-01T12:43:00Z",
+        incident_start=commits[1]["date"],
         branch="connectors",
         limit=10,
     )

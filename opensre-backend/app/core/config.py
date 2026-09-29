@@ -40,6 +40,20 @@ class Settings:
         "http://localhost:3000",
     )
 
+    # Alertmanager, reached through a `kubectl port-forward` (see
+    # app/services/portforward.py -- FORWARDS["alertmanager"]).
+    #
+    # Alertmanager's own webhook receiver points at the IN-CLUSTER backend
+    # service, but the dashboard is served by the HOST backend, and pods
+    # cannot reach the host in this kind/podman setup. So the host backend
+    # pulls alert state from Alertmanager's read API instead of receiving
+    # the push, and feeds it through the same alert_store lifecycle the
+    # webhook uses.
+    ALERTMANAGER_URL = os.getenv(
+        "ALERTMANAGER_URL",
+        "http://localhost:9093",
+    )
+
     AEROSPIKE_HOSTS = os.getenv("AEROSPIKE_HOSTS", "aerospike.databases.svc.cluster.local:3000")
     AEROSPIKE_NAMESPACE = os.getenv("AEROSPIKE_NAMESPACE", "test")
 

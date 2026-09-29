@@ -220,20 +220,35 @@ def active_faults():
 
 @router.get("/status")
 def status():
-    runbook = _command(["bash", str(RUNBOOK), "status"])
+    # Each probe shells out to kubectl/docker and is independent, so run
+    # them in parallel: the page loads in one round-trip instead of
+    # ~4 serial subprocess calls. (The runbook preflight is deliberately
+    # NOT part of status — it alone took ~2s and nothing in the UI reads it.)
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        f_aero = pool.submit(_container_state, "aerospike")
+        f_yug = pool.submit(_container_state, "yugabyte")
+        f_node = pool.submit(_worker_node_state)
+        f_pods = pool.submit(_opensre_pods)
+        aero, yug, node, pods = (
+            f_aero.result(),
+            f_yug.result(),
+            f_node.result(),
+            f_pods.result(),
+        )
 
     return {
         "success": True,
         "containers": {
-            "aerospike": _container_state("aerospike"),
-            "yugabyte": _container_state("yugabyte"),
+            "aerospike": aero,
+            "yugabyte": yug,
         },
         "node": {
             "name": "opensre-demo-worker",
-            "state": _worker_node_state(),
+            "state": node,
         },
-        "pods": _opensre_pods(),
-        "runbook": runbook,
+        "pods": pods,
     }
 
 

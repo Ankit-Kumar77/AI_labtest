@@ -28,14 +28,51 @@ STORE_PATH = DATA_DIR / "alerts.jsonl"
 MAX_RECORDS = 200
 MAX_ANNOTATION_CHARS = 1000
 
+# Alertmanager re-fires a firing alert every `repeat_interval` (1m in
+# infra/k8s/alerting/alertmanager.yaml). Three missed repeats means
+# Alertmanager is no longer telling us about the alert, so the record is
+# stale and keeping it `firing` would pin a phantom incident to the UI.
+STALE_FIRING_SECONDS = 180
+
 _lock = threading.Lock()
 
 STATUS_FIRING = "firing"
 STATUS_RESOLVED = "resolved"
 
+# Investigation lifecycle. `pending` is only ever a transient state that a
+# live worker thread owns; if a process dies mid-investigation nothing will
+# ever move it on, so startup recovery rewrites it to `interrupted`.
+INVESTIGATION_PENDING = "pending"
+INVESTIGATION_INTERRUPTED = "interrupted"
+INVESTIGATION_RESOLVED = "resolved"
+INVESTIGATION_FAILED = "failed"
+INVESTIGATION_SKIPPED = "skipped"
+
+# States that mean "the last attempt did not produce a usable RCA", so a
+# repeat firing is allowed to retry instead of being silently ignored.
+RETRYABLE_INVESTIGATION_STATES = frozenset(
+    {INVESTIGATION_PENDING, INVESTIGATION_FAILED, INVESTIGATION_INTERRUPTED}
+)
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value) -> datetime | None:
+    """Best-effort RFC3339/ISO-8601 parse; None if unusable."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def compute_fingerprint(alert: dict) -> str:
@@ -93,7 +130,7 @@ def _build_record(alert: dict, envelope: dict, fingerprint: str) -> dict:
         "starts_at": alert.get("startsAt") or "",
         "ends_at": alert.get("endsAt") or "",
         "notification_count": 1,
-        "investigation_status": "pending",
+        "investigation_status": INVESTIGATION_PENDING,
         "investigation": None,
         "slack_notified": False,
     }
@@ -170,7 +207,7 @@ def upsert(alert: dict, envelope: dict | None = None) -> tuple[dict, bool]:
             if resolved:
                 record["status"] = STATUS_RESOLVED
                 record["ends_at"] = alert.get("endsAt") or _utcnow()
-                record["investigation_status"] = "skipped"
+                record["investigation_status"] = INVESTIGATION_SKIPPED
                 record["slack_notified"] = False
             records.append(record)
             _write_all(_prune_locked(records))
@@ -219,13 +256,33 @@ def _replace(records: list, record: dict) -> None:
     _write_all(_prune_locked(records))
 
 
+def mark_investigating(fingerprint: str) -> dict | None:
+    """Flag an alert as having a live worker before the thread starts.
+
+    Persisting `pending` up front means a crash mid-run is visible as
+    orphaned state (see `recover_orphaned_investigations`) rather than
+    leaving the previous attempt's result looking current.
+    """
+    with _lock:
+        records = _read_all()
+        for record in records:
+            if record.get("fingerprint") == fingerprint:
+                record["investigation_status"] = INVESTIGATION_PENDING
+                record["investigation"] = None
+                _replace(records, record)
+                return record
+    return None
+
+
 def update_investigation(fingerprint: str, result: dict) -> dict | None:
     """Attach the OpenSRE investigation result to a stored alert."""
     with _lock:
         records = _read_all()
         for record in records:
             if record.get("fingerprint") == fingerprint:
-                record["investigation_status"] = "resolved" if result.get("success") else "failed"
+                record["investigation_status"] = (
+                    INVESTIGATION_RESOLVED if result.get("success") else INVESTIGATION_FAILED
+                )
                 record["investigation"] = result
                 _replace(records, record)
                 return record
@@ -271,7 +328,88 @@ def _to_summary(record: dict) -> dict:
         "notification_count": record.get("notification_count"),
         "investigation_status": record.get("investigation_status"),
         "has_investigation": bool(investigation),
+        # The saved-report link the dashboard needs: the persisted incident
+        # id of the latest RCA run, plus the outcome for the table badge.
+        "incident_id": investigation.get("incident_id") if investigation else None,
+        "investigation_success": bool(investigation.get("success")) if investigation else None,
+        "investigation_error": (investigation.get("error") or None) if investigation else None,
     }
+
+
+def _age_seconds(record: dict, now: datetime) -> float | None:
+    """Seconds since we last heard about this alert, or None if unknown."""
+    seen = _parse_ts(record.get("last_seen")) or _parse_ts(record.get("first_seen"))
+    if seen is None:
+        return None
+    return (now - seen).total_seconds()
+
+
+def recover_orphaned_investigations() -> list[dict]:
+    """Rewrite `pending` investigations that no live worker owns.
+
+    `_run_investigation()` runs in a daemon thread, so if the process dies
+    (rollout, crash, node restart) a record persisted as `pending` is left
+    pointing at a worker that no longer exists. Nothing else ever advances
+    it, and repeat firings do not re-investigate, so it would sit at
+    `pending` forever. Mark those `interrupted` so the next repeat firing
+    can retry.
+    """
+    reaped = []
+    with _lock:
+        records = _read_all()
+        dirty = False
+        for record in records:
+            if record.get("investigation_status") != INVESTIGATION_PENDING:
+                continue
+            record["investigation_status"] = INVESTIGATION_INTERRUPTED
+            if not record.get("investigation"):
+                record["investigation"] = {
+                    "success": False,
+                    "error": "investigation was interrupted before it completed "
+                             "(backend restarted mid-run)",
+                }
+            reaped.append(record)
+            dirty = True
+        if dirty:
+            _write_all(records)
+    return reaped
+
+
+def reap_stale_firing(
+    stale_seconds: float = STALE_FIRING_SECONDS,
+    now: datetime | None = None,
+) -> list[dict]:
+    """Auto-resolve firing alerts that Alertmanager stopped re-delivering.
+
+    We only ever learn an alert resolved from a webhook. If the resolution
+    is missed -- backend down, or Alertmanager restarting and losing its
+    state -- the record stays `firing` forever and the dashboard shows a
+    phantom incident that no longer exists. Because Alertmanager re-fires
+    every `repeat_interval`, silence past `stale_seconds` means it is no
+    longer firing, so close the lifecycle here.
+    """
+    now = now or datetime.now(timezone.utc)
+    reaped = []
+    with _lock:
+        records = _read_all()
+        dirty = False
+        for record in records:
+            if record.get("status") != STATUS_FIRING:
+                continue
+            age = _age_seconds(record, now)
+            # An unparseable timestamp is not evidence of staleness; leave it.
+            if age is None or age < stale_seconds:
+                continue
+            record["status"] = STATUS_RESOLVED
+            record["ends_at"] = record.get("ends_at") or _utcnow()
+            record["auto_resolved"] = True
+            if record.get("investigation_status") == INVESTIGATION_PENDING:
+                record["investigation_status"] = INVESTIGATION_INTERRUPTED
+            reaped.append(record)
+            dirty = True
+        if dirty:
+            _write_all(records)
+    return reaped
 
 
 def list_alerts(limit: int = 100) -> dict:

@@ -1,0 +1,14 @@
+lz4-4.4.5.dist-info/INSTALLER,sha256=5hhM4Q4mYTT9z6QB6PGpUAW81PGNFrYrdXMj4oM_6ak,2
+lz4-4.4.5.dist-info/METADATA,sha256=CGaN_fEyhe_bKiuDwc4GzuGLscVCZiw1Hz2lbjrGC5o,3838
+lz4-4.4.5.dist-info/RECORD,,
+lz4-4.4.5.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+lz4-4.4.5.dist-info/WHEEL,sha256=2iHh9e2o6T3nHtu_NVT7Cs7pebIqF94rZK8zrQfgoJI,190
+lz4-4.4.5.dist-info/licenses/LICENSE,sha256=4qxD1uuA605SFBgXyBJDfguYGx17LcfMhsfvVSQETG8,1495
+lz4-4.4.5.dist-info/top_level.txt,sha256=cX6_gxFUdNSo40TfxrGpTCgu7epGm3yW3m2k7irTDzI,4
+lz4/__init__.py,sha256=etsV-XG9vgCn-EKrFpzWJsGIp-VUtH-tpNrQmMmDECU,627
+lz4/_version.cpython-313-x86_64-linux-gnu.so,sha256=HXxpDskdvp-bkRFVk_Pi8CnbUQE57NYMzEggw4XwGAI,1218048
+lz4/block/__init__.py,sha256=KsSQGgaPpJtVPJ5QfMadVGFduMy0hSetJHWGNmOvpso,70
+lz4/block/_block.cpython-313-x86_64-linux-gnu.so,sha256=HgVBD4sJxda46o8cckhUfY3P1-v7vy-feqIudZ-xChk,2167824
+lz4/frame/__init__.py,sha256=RlTfZBNjvi9D1VKA0uuUCtABmy3VgORRxqTaKlowcCQ,31165
+lz4/frame/_frame.cpython-313-x86_64-linux-gnu.so,sha256=2nlpKDrkr_5rOiJIO7qD7SEdAKtqlaEoGKKPDc_9AwQ,2407712
+lz4/version.py,sha256=WkA0S29KaJ-cd_1Xo9b_Acds7UNp4LH2JZMSyDV5iMA,712

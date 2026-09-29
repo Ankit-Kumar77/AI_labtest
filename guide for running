@@ -81,6 +81,13 @@ TERMINAL 3 - VictoriaMetrics Port-Forward (REQUIRED for Metrics)
 TERMINAL 4 - OpenTelemetry Port-Forward (REQUIRED for Traces)
   kubectl port-forward -n observability svc/otel-collector-opentelemetry-collector 4317:4317 4318:4318
 
+TERMINAL 4a - Alertmanager Port-Forward (REQUIRED for the Alerting page)
+  kubectl port-forward -n observability svc/alertmanager 9093:9093
+  # Alertmanager's own webhook targets the IN-CLUSTER backend, which the host
+  # backend cannot receive from (pods cannot reach the host). The host backend
+  # therefore PULLS alert state from this port-forward every 20s. Without it
+  # the Alerting page shows "unreachable" and no incidents are created.
+
 TERMINAL 4b - YugabyteDB Port-Forward (REQUIRED for backend → K8s DB)
   kubectl port-forward -n databases svc/yugabytedb 5433:5433
 
@@ -105,12 +112,14 @@ TERMINAL 7 - Grafana (optional, if not using Kind port 3000)
 ACCESS URLS
 =========================================================
 Frontend (Dashboard)     : http://localhost:5173
+Alerting                 : http://localhost:5173/alerting
 Backend API              : http://localhost:8001
 Backend Swagger          : http://localhost:8001/docs
 Grafana                  : http://localhost:3000 (via Kind) or http://localhost:3000 (port-forward)
 Elasticsearch            : http://localhost:9200 (port-forward)
 Kibana                   : http://localhost:5601 (port-forward)
 VictoriaMetrics          : http://localhost:8428 (port-forward)
+Alertmanager             : http://localhost:9093 (port-forward)
 YugabyteDB (K8s)         : localhost:5433 via port-forward (svc/yugabytedb 5433:5433)
   # In-cluster DNS: yugabytedb.databases.svc.cluster.local:5433
 Aerospike (K8s)          : localhost:3001 via port-forward (svc/aerospike 3001:3000)
@@ -125,12 +134,34 @@ YugabyteDB (K8s):      curl http://localhost:8001/api/yugabyte/health
 Aerospike (K8s):       curl http://localhost:8001/api/aerospike/health
 Elasticsearch health:  curl http://localhost:8001/api/elasticsearch/health
 ES Facets:             curl http://localhost:8001/api/elasticsearch/facets?since_minutes=60
+Alertmanager overview: curl http://localhost:8001/api/alertmanager/overview
+Alertmanager sync:     curl -X POST http://localhost:8001/api/alertmanager/sync
+Active incidents:      curl http://localhost:8001/api/alerts/active
 VictoriaMetrics:       curl http://localhost:8428/-/healthy
 Grafana:               curl http://localhost:3000/api/health
 Kibana:                curl http://localhost:5601/api/status
 Frontend:              open http://localhost:5173
 Kubernetes DBs:        kubectl get pods -n databases
 Kubernetes all:        kubectl get pods -A
+
+=========================================================
+ALERTING DEMO
+=========================================================
+The Alerting page (http://localhost:5173/alerting) shows the whole chain:
+  vmalert (rules) -> Alertmanager (grouping/routing) -> backend sync
+  -> incident -> OpenSRE RCA
+
+1. Open the Alerting page and confirm the pipeline banner reads "Healthy"
+   and shows a non-zero "Firing in Alertmanager" count.
+2. Click "Inject test alert" — it POSTs to Alertmanager's real
+   /api/v2/alerts API, so it goes through grouping and inhibition.
+3. Within ~20s (or immediately via "Sync now") the alert appears under
+   "Alert-driven incidents" with an RCA badge.
+4. The RCA runs in the background; the badge goes pending -> resolved
+   (or failed/interrupted if the LLM provider is unavailable).
+
+Note: the RCA step calls the configured LLM provider. With no API key the
+badge stays "failed" — the alert plumbing still works, only the RCA does not.
 
 =========================================================
 DATABASE FAILURE INJECTION DEMO (NEW!)
@@ -160,6 +191,10 @@ TROUBLESHOOTING
 - If Elasticsearch unavailable in Logs tab: ensure TERMINAL 1 port-forward is running
 - If Kibana won't open: ensure TERMINAL 2 port-forward is running
 - If no metrics: ensure TERMINAL 3 port-forward is running
+- If the Alerting page says Alertmanager is unreachable, or no incidents
+  ever appear: ensure TERMINAL 4a port-forward is running.
+      kubectl port-forward -n observability svc/alertmanager 9093:9093
+  The page prints this exact command when the forward is down.
 - If backend can't connect to ES: restart backend AFTER starting port-forward
 - If YugabyteDB/Aerospike show "Unreachable" but you didn't inject:
   check kubectl get pods -n databases (both should be 1/1 Running).

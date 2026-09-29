@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import api, { nginxDemoApi, corednsDemoApi, elkDemoApi } from "../api/api";
 import Card from "../components/Card";
@@ -108,6 +108,7 @@ function signalRow(label, signals) {
 export default function Chaos() {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [running, setRunning] = useState(null);
   const [log, setLog] = useState("");
   const [error, setError] = useState(null);
@@ -125,7 +126,12 @@ export default function Chaos() {
   const [k8sPod, setK8sPod] = useState("");
   const [k8sInvestigating, setK8sInvestigating] = useState(false);
 
-  const refreshStatus = async () => {
+  const refreshStatus = async ({ initial = false } = {}) => {
+    // Normally a background refresh: keep the current cards on screen and
+    // only swap in fresh data when it arrives. The full-page loading is
+    // reserved for the very first load, so the dashboard never blanks out
+    // and re-builds on every visit.
+    if (initial) setLoading(true);
     try {
       const [s, a, h, ns, nh, cs, es] = await Promise.all([
         api.get("/chaos/status"),
@@ -137,7 +143,7 @@ export default function Chaos() {
         elkDemoApi.status().catch(() => ({ data: null })),
       ]);
       if (s.data.success) setStatus(s.data);
-      else setError(s.data.error);
+      else if (initial) setError(s.data.error);
       setActiveFaults(a.data.data || {});
       setHistory(h.data.data || []);
       if (ns?.data?.success) setNginxState(ns.data);
@@ -145,14 +151,21 @@ export default function Chaos() {
       if (cs?.data?.success) setCorednsState(cs.data);
       if (es?.data?.success) setElkState(es.data);
     } catch (e) {
-      setError(e.message);
+      if (initial) setError(e.message);
     } finally {
-      setLoading(false);
+      if (initial) setLoading(false);
     }
   };
 
+  // React StrictMode double-invokes mount effects in dev, which fired two
+  // identical refreshes (and two ~3s loading flashes) on every visit.
+  // Guard so the first load runs exactly once per mount.
+  const booted = useRef(false);
+
   useEffect(() => {
-    refreshStatus();
+    if (booted.current) return;
+    booted.current = true;
+    refreshStatus({ initial: true });
   }, []);
 
   const runAction = async (kind, action, label) => {
@@ -411,11 +424,14 @@ export default function Chaos() {
           </p>
         </div>
         <button
-          onClick={() => { setLoading(true); refreshStatus(); }}
+          onClick={() => {
+            setRefreshing(true);
+            refreshStatus().finally(() => setRefreshing(false));
+          }}
           className="btn btn--ghost btn--sm"
-          disabled={loading}
+          disabled={loading || refreshing}
         >
-          <RefreshCw size={14} className={loading ? "btn__spinner" : ""} /> Refresh
+          <RefreshCw size={14} className={refreshing ? "btn__spinner" : ""} /> Refresh
         </button>
       </div>
 
